@@ -12,7 +12,7 @@
    1. CONFIGURAÇÃO — preencha com os dados do seu projeto Firebase
    (Console do Firebase > Configurações do projeto > Seus apps > App da Web)
    ===================================================================== */
-const firebaseConfig = {
+const FIREBASE_CONFIG = {
   apiKey: "AIzaSyAtoVPTGvwmQ-wOnKuKVFFKHkTwV43tGZI",
   authDomain: "insumo-pro.firebaseapp.com",
   projectId: "insumo-pro",
