@@ -1,0 +1,161 @@
+rules_version = '2';
+
+// Regras de segurança do app de troca de escala.
+// Quem garante o acesso é o banco, não a tela: um gestor só lê e altera a própria
+// equipe, e cada colaborador só vê os revezamentos de que participa.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ---------------- Funções auxiliares ---------------- */
+    function logado() { return request.auth != null; }
+    function caminho(uid) { return /databases/$(database)/documents/usuarios/$(uid); }
+    function eu() { return get(caminho(request.auth.uid)).data; }
+    function temPerfil() { return logado() && exists(caminho(request.auth.uid)); }
+    function ativo() { return temPerfil() && eu().ativo == true; }
+    function papel(p) { return ativo() && eu().papel == p; }
+    function admin() { return papel('admin'); }
+    function gestor() { return papel('gestor'); }
+    function alterados() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function setupFeito() { return exists(/databases/$(database)/documents/config/setup); }
+
+    function texto(v, max) { return v is string && v.size() > 0 && v.size() <= max; }
+    function textoOpc(v, max) { return v is string && v.size() <= max; }
+    function dataISO(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+
+    // getAfter: enxerga o estado depois de um lote (renomear um gestor e a equipe juntos)
+    function gestorValido(gUid, gNome) {
+      return gUid is string
+        && existsAfter(caminho(gUid))
+        && getAfter(caminho(gUid)).data.papel == 'gestor'
+        && getAfter(caminho(gUid)).data.nome == gNome;
+    }
+
+    function usuarioValido(d) {
+      return d.keys().hasAll(['matricula', 'nome', 'empresa', 'papel', 'ativo', 'trocarSenha',
+                              'equipe', 'entrada', 'saida', 'horario', 'gestorUid', 'gestorNome'])
+        && d.keys().hasOnly(['matricula', 'nome', 'empresa', 'papel', 'ativo', 'trocarSenha',
+                             'equipe', 'entrada', 'saida', 'horario', 'gestorUid', 'gestorNome',
+                             'criadoEm', 'atualizadoEm'])
+        && texto(d.matricula, 20) && texto(d.nome, 120) && texto(d.empresa, 60)
+        && d.papel in ['colaborador', 'gestor', 'admin']
+        && d.ativo is bool && d.trocarSenha is bool
+        && textoOpc(d.equipe, 30) && textoOpc(d.entrada, 10) && textoOpc(d.saida, 10) && textoOpc(d.horario, 40)
+        && ((d.papel == 'colaborador' && gestorValido(d.gestorUid, d.gestorNome))
+            || (d.papel != 'colaborador' && d.gestorUid == null && d.gestorNome == ''));
+    }
+
+    // Os dados pessoais copiados para a troca precisam ser os do cadastro de quem está gravando
+    function retratoValido(r) {
+      let u = eu();
+      return r.keys().hasOnly(['nome', 'matricula', 'empresa', 'equipe', 'horario', 'entrada', 'saida', 'gestorUid', 'gestorNome'])
+        && r.nome == u.nome && r.matricula == u.matricula && r.empresa == u.empresa
+        && r.equipe == u.equipe && r.horario == u.horario
+        && r.gestorUid == u.gestorUid && r.gestorNome == u.gestorNome
+        && textoOpc(r.entrada, 10) && textoOpc(r.saida, 10);
+    }
+
+    /* ---------------- Configuração inicial ---------------- */
+    match /config/setup {
+      allow get: if true;
+      allow create: if logado() && !setupFeito()
+        && request.resource.data.adminUid == request.auth.uid
+        && getAfter(caminho(request.auth.uid)).data.papel == 'admin';
+    }
+
+    /* ---------------- Usuários ---------------- */
+    match /usuarios/{uid} {
+      allow get: if logado() && (request.auth.uid == uid || admin()
+                    || (gestor() && resource.data.gestorUid == request.auth.uid));
+      allow list: if admin() || (gestor() && resource.data.gestorUid == request.auth.uid);
+
+      allow create: if logado() && usuarioValido(request.resource.data) && (
+          admin()
+          || (gestor() && request.resource.data.papel == 'colaborador'
+                       && request.resource.data.gestorUid == request.auth.uid)
+          // primeiro acesso: o primeiro usuário vira administrador, uma única vez
+          || (request.auth.uid == uid && request.resource.data.papel == 'admin'
+              && request.resource.data.ativo == true && !setupFeito()
+              && existsAfter(/databases/$(database)/documents/config/setup))
+        );
+
+      allow update: if logado() && (
+          (admin() && usuarioValido(request.resource.data)
+                   && request.resource.data.matricula == resource.data.matricula)
+          || (gestor() && resource.data.gestorUid == request.auth.uid
+                       && usuarioValido(request.resource.data)
+                       && !alterados().hasAny(['papel', 'gestorUid', 'gestorNome', 'matricula']))
+          // a própria pessoa só pode marcar que já trocou a senha provisória
+          || (request.auth.uid == uid && alterados().hasOnly(['trocarSenha'])
+              && request.resource.data.trocarSenha == false)
+        );
+
+      allow delete: if false;
+    }
+
+    /* ---------------- Revezamentos ---------------- */
+    match /trocas/{id} {
+      function t() { return resource.data; }
+      function n() { return request.resource.data; }
+
+      function todosAprovaram() {
+        let a = n().aprovacoes;
+        let g = t().gestores;
+        return (g[0] in a) && a[g[0]].decisao == 'aprovada'
+          && (g.size() == 1 || ((g[1] in a) && a[g[1]].decisao == 'aprovada'));
+      }
+
+      // Quem participa, os gestores envolvidos e o RH leem. Um convite ainda sem colega
+      // pode ser aberto por quem recebeu o link (é preciso saber o código do pedido).
+      allow get: if ativo() && (request.auth.uid in t().participantes || request.auth.uid in t().gestores
+                                || admin() || t().etapa == 'aguardando_parceiro');
+      allow list: if ativo() && (request.auth.uid in t().participantes || request.auth.uid in t().gestores || admin());
+
+      allow create: if papel('colaborador') && eu().gestorUid is string
+        && n().keys().hasOnly(['tipo', 'etapa', 'solicitanteUid', 'solicitante', 'dataFolgaSolicitante',
+                               'parceiroUid', 'parceiro', 'dataFolgaParceiro', 'participantes', 'gestores',
+                               'aprovacoes', 'observacao', 'criadoEm', 'atualizadoEm'])
+        && n().tipo == 'revezamento' && n().etapa == 'aguardando_parceiro'
+        && n().solicitanteUid == request.auth.uid && retratoValido(n().solicitante)
+        && dataISO(n().dataFolgaSolicitante)
+        && n().parceiroUid == null && n().parceiro == null && n().dataFolgaParceiro == null
+        && n().participantes == [request.auth.uid] && n().gestores == [eu().gestorUid]
+        && n().aprovacoes == {} && textoOpc(n().observacao, 300)
+        && n().criadoEm == request.time && n().atualizadoEm == request.time;
+
+      allow update: if ativo() && n().atualizadoEm == request.time && (
+          // 1) o colega aceita o convite e informa a folga dele
+          (papel('colaborador') && eu().gestorUid is string
+            && t().etapa == 'aguardando_parceiro' && request.auth.uid != t().solicitanteUid
+            && alterados().hasOnly(['etapa', 'parceiroUid', 'parceiro', 'dataFolgaParceiro', 'participantes', 'gestores', 'atualizadoEm'])
+            && n().etapa == 'aguardando_gestor' && n().parceiroUid == request.auth.uid
+            && retratoValido(n().parceiro)
+            && dataISO(n().dataFolgaParceiro) && n().dataFolgaParceiro != t().dataFolgaSolicitante
+            && n().participantes == [t().solicitanteUid, request.auth.uid]
+            && ((eu().gestorUid == t().gestores[0] && n().gestores == t().gestores)
+                || (eu().gestorUid != t().gestores[0] && n().gestores == [t().gestores[0], eu().gestorUid])))
+
+          // 2) quem pediu cancela enquanto não houve decisão final
+          || (request.auth.uid == t().solicitanteUid
+            && t().etapa in ['aguardando_parceiro', 'aguardando_gestor']
+            && alterados().hasOnly(['etapa', 'atualizadoEm']) && n().etapa == 'cancelada')
+
+          // 3) um gestor envolvido registra a própria decisão
+          || (gestor() && request.auth.uid in t().gestores && t().etapa == 'aguardando_gestor'
+            && alterados().hasOnly(['aprovacoes', 'etapa', 'atualizadoEm'])
+            && n().aprovacoes.diff(t().aprovacoes).affectedKeys().hasOnly([request.auth.uid])
+            && n().aprovacoes[request.auth.uid].keys().hasOnly(['decisao', 'nome', 'motivo', 'em'])
+            && n().aprovacoes[request.auth.uid].decisao in ['aprovada', 'recusada']
+            && n().aprovacoes[request.auth.uid].nome == eu().nome
+            && textoOpc(n().aprovacoes[request.auth.uid].motivo, 300)
+            && n().aprovacoes[request.auth.uid].em == request.time
+            && n().etapa in ['aguardando_gestor', 'aprovada', 'recusada']
+            && (n().aprovacoes[request.auth.uid].decisao == 'aprovada' || n().etapa == 'recusada')
+            && (n().etapa != 'recusada' || n().aprovacoes[request.auth.uid].decisao == 'recusada')
+            && (n().etapa != 'aprovada' || todosAprovaram())
+            && (n().etapa != 'aguardando_gestor' || !todosAprovaram()))
+        );
+
+      allow delete: if false;
+    }
+  }
+}
