@@ -9,10 +9,12 @@
 "use strict";
 
 /* =====================================================================
-   1. CONFIGURAÇÃO — preencha com os dados do seu projeto Firebase
-   (Console do Firebase > Configurações do projeto > Seus apps > App da Web)
+   1. CONFIGURAÇÃO
+   Dados do projeto Firebase (já preenchidos: projeto "insumo-pro").
+   Para trocar de projeto, substitua o bloco abaixo pelo "const firebaseConfig = { ... };" que o Firebase
+   mostra em Configurações do projeto > Seus apps > App da Web (sem as linhas "import" e "initializeApp").
    ===================================================================== */
-const FIREBASE_CONFIG = {
+const firebaseConfig = {
   apiKey: "AIzaSyAtoVPTGvwmQ-wOnKuKVFFKHkTwV43tGZI",
   authDomain: "insumo-pro.firebaseapp.com",
   projectId: "insumo-pro",
@@ -21,6 +23,7 @@ const FIREBASE_CONFIG = {
   appId: "1:334371369968:web:a4215ae8b6f17eb61c6335",
   measurementId: "G-QMD87RLG13"
 };
+
 // A matrícula vira o login: 4201 -> 4201@colaboradores.troca-escala.app (o domínio não precisa existir).
 // Não altere depois de cadastrar usuários.
 const DOMINIO_LOGIN = "colaboradores.troca-escala.app";
@@ -29,9 +32,13 @@ const EMPRESAS = ["BIANCOGRES", "LM COMÉRCIO"];
 const MODELO_PDF = "modelo-un-fo-spe-023.pdf";
 
 /* ---------- Conexão com o Firebase ---------- */
-const configurado = Boolean(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId);
-const auth = configurado ? (firebase.initializeApp(FIREBASE_CONFIG), firebase.auth()) : null;
-const db = configurado ? firebase.firestore() : null;
+// Aberto com duplo clique (file://)? O login do Firebase só funciona num endereço http(s).
+const abertoComoArquivo = location.protocol === "file:";
+const firebaseCarregado = typeof firebase !== "undefined";
+const configurado = Boolean(firebaseConfig && firebaseConfig.apiKey && firebaseConfig.projectId);
+const pronto = configurado && firebaseCarregado && !abertoComoArquivo;
+const auth = pronto ? (firebase.initializeApp(firebaseConfig), firebase.auth()) : null;
+const db = pronto ? firebase.firestore() : null;
 const agora = () => firebase.firestore.FieldValue.serverTimestamp();
 
 
@@ -41,7 +48,8 @@ const agora = () => firebase.firestore.FieldValue.serverTimestamp();
 const ETAPAS = {
   aguardando_parceiro: { rotulo: "Aguardando colega", tom: "espera" },
   aguardando_gestor: { rotulo: "Aguardando gestor", tom: "espera" },
-  aprovada: { rotulo: "Aprovada", tom: "ok" },
+  aprovada: { rotulo: "Aprovada", tom: "info" },
+  concluida: { rotulo: "Concluída", tom: "ok" },
   recusada: { rotulo: "Recusada", tom: "erro" },
   cancelada: { rotulo: "Cancelada", tom: "neutro" },
   pendente: { rotulo: "Pendente", tom: "espera" },
@@ -113,6 +121,7 @@ function mensagemErro(e) {
     "auth/network-request-failed": "Sem conexão. Verifique a internet e tente de novo.",
     "auth/requires-recent-login": "Por segurança, saia e entre de novo antes de trocar a senha.",
     "auth/operation-not-allowed": "O login por e-mail/senha não está ativado no Firebase.",
+    "auth/unauthorized-domain": "Este endereço não está autorizado no Firebase (Authentication > Configurações > Domínios autorizados).",
     "permission-denied": "Você não tem permissão para essa ação.",
     unavailable: "Sem conexão com o servidor. Tente de novo.",
   };
@@ -178,7 +187,7 @@ const Banco = {
   /** Cria a conta de login de outra pessoa sem desconectar quem está cadastrando. */
   async cadastrarUsuario(dados, senha) {
     const perfil = { ...Banco.perfilBase(dados), trocarSenha: true, criadoEm: agora() };
-    const appSec = firebase.initializeApp(FIREBASE_CONFIG, "cadastro-" + Date.now());
+    const appSec = firebase.initializeApp(firebaseConfig, "cadastro-" + Date.now());
     try {
       const cred = await appSec.auth().createUserWithEmailAndPassword(emailDaMatricula(perfil.matricula), senha);
       try {
@@ -279,6 +288,15 @@ const Banco = {
     await db.collection("trocas").doc(troca.id).update({
       ["aprovacoes." + perfil.uid]: { decisao, nome: perfil.nome, motivo: String(motivo || "").trim(), em: agora() },
       etapa: decisao === "recusada" ? "recusada" : todos ? "aprovada" : "aguardando_gestor",
+      atualizadoEm: agora(),
+    });
+  },
+
+  /** Depois de aprovada: o gestor (ou o RH) marca que o documento foi gerado, assinado e entregue. */
+  async concluirTroca(troca, perfil) {
+    await db.collection("trocas").doc(troca.id).update({
+      etapa: "concluida",
+      concluidaPor: { uid: perfil.uid, nome: perfil.nome, em: agora() },
       atualizadoEm: agora(),
     });
   },
@@ -724,7 +742,7 @@ function telaTroca(perfil, id) {
   let main = tela({ ...base, titulo: "Revezamento" });
   mais(main, carregando());
   // o que foi digitado sobrevive às atualizações em tempo real
-  const memoria = { dataFolga: "", entrada: perfil.entrada || "", saida: perfil.saida || "", recusando: false, motivo: "", confirmarCancelar: false };
+  const memoria = { dataFolga: "", entrada: perfil.entrada || "", saida: perfil.saida || "", recusando: false, motivo: "", confirmarCancelar: false, confirmarConcluir: false };
 
   guardar(Banco.ouvirTroca(id, desenhar, () => desenhar(null)));
 
@@ -750,7 +768,8 @@ function telaTroca(perfil, id) {
     const direita = h("div", { class: "pilha" },
       souSolicitante && troca.etapa === "aguardando_parceiro" && compartilhar(troca),
       souGestor && troca.etapa === "aguardando_gestor" && !(troca.aprovacoes || {})[perfil.uid] && decisao(troca, erro),
-      troca.parceiro && troca.etapa !== "cancelada" && (souGestor || perfil.papel === "admin" || troca.etapa === "aprovada") && botaoPdf(troca, erro),
+      troca.parceiro && troca.etapa !== "cancelada" && (souGestor || perfil.papel === "admin" || troca.etapa === "aprovada" || troca.etapa === "concluida") && botaoPdf(troca, erro),
+      (souGestor || perfil.papel === "admin") && troca.etapa === "aprovada" && concluir(troca, erro),
       souSolicitante && ativa && cancelar(troca, erro),
       (souSolicitante || souParceiro) && situacao(troca));
     mais(main, erro, h("div", { class: "detalhe" }, esquerda, direita));
@@ -759,7 +778,8 @@ function telaTroca(perfil, id) {
   function situacao(troca) {
     const msgs = {
       aguardando_gestor: ["", "O revezamento foi combinado e está com o gestor para aprovação."],
-      aprovada: ["ok", "Revezamento aprovado. O gestor gera o documento oficial."],
+      aprovada: ["ok", "Revezamento aprovado. O gestor gera o documento oficial e marca como concluído."],
+      concluida: ["ok", "Revezamento concluído."],
       recusada: ["erro", "O revezamento foi recusado pelo gestor."],
       cancelada: ["", "Este pedido foi cancelado."],
     };
@@ -791,7 +811,11 @@ function telaTroca(perfil, id) {
             h("div", { class: "meta" }, a ? `${a.decisao === "aprovada" ? "Aprovou" : "Recusou"} em ${quando(a.em)}` : "Ainda não decidiu"),
             a && a.motivo && h("div", { class: "meta" }, "Motivo: " + a.motivo)),
           etiqueta(a ? a.decisao : "pendente"));
-      }));
+      }),
+      troca.concluidaPor && h("div", { class: "pessoa" }, iniciais(troca.concluidaPor.nome),
+        h("div", { style: { flex: 1, minWidth: 0 } }, h("div", { class: "nome" }, troca.concluidaPor.nome),
+          h("div", { class: "meta" }, "Marcou como concluída em " + quando(troca.concluidaPor.em))),
+        etiqueta("concluida")));
   }
 
   function compartilhar(troca) {
@@ -864,6 +888,29 @@ function telaTroca(perfil, id) {
     return caixa;
   }
 
+  function concluir(troca, erro) {
+    const caixa = h("div", { class: "cartao pilha", style: { gap: "10px" } });
+    const montar = () => {
+      if (memoria.confirmarConcluir) {
+        const voltar = h("button", { class: "btn", onClick: () => { memoria.confirmarConcluir = false; montar(); } }, "Voltar");
+        const sim = h("button", { class: "btn ok", onClick: async () => {
+          erro.mostrar(""); sim.disabled = true; voltar.disabled = true;
+          try { await Banco.concluirTroca(troca, perfil); toast("Revezamento concluído."); }
+          catch (err) { erro.mostrar(mensagemErro(err)); sim.disabled = false; voltar.disabled = false; }
+        } }, "Sim, concluir");
+        por(caixa, h("h2", {}, "Concluir revezamento"),
+          h("p", { class: "sub" }, "Confirme que o documento já foi gerado, assinado e entregue ao Departamento de Pessoal."),
+          h("div", { class: "acoes" }, voltar, sim));
+      } else {
+        por(caixa, h("h2", {}, "Concluir revezamento"),
+          h("p", { class: "sub" }, "Depois de gerar o PDF e entregar o documento assinado, marque como concluído. O pedido sai da lista de pendentes."),
+          h("button", { class: "btn ok bloco", onClick: () => { memoria.confirmarConcluir = true; montar(); } }, "Marcar como concluída"));
+      }
+    };
+    montar();
+    return caixa;
+  }
+
   function cancelar(troca, erro) {
     const caixa = h("div", {});
     const montar = () => {
@@ -886,7 +933,8 @@ function telaTroca(perfil, id) {
 const FILTROS = [
   { id: "todas", rotulo: "Todas", f: () => true },
   { id: "andamento", rotulo: "Em andamento", f: (t) => t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor" },
-  { id: "aprovada", rotulo: "Aprovadas", f: (t) => t.etapa === "aprovada" },
+  { id: "aprovada", rotulo: "Aprovadas (a concluir)", f: (t) => t.etapa === "aprovada" },
+  { id: "concluida", rotulo: "Concluídas", f: (t) => t.etapa === "concluida" },
   { id: "recusada", rotulo: "Recusadas", f: (t) => t.etapa === "recusada" },
   { id: "cancelada", rotulo: "Canceladas", f: (t) => t.etapa === "cancelada" },
 ];
@@ -895,12 +943,14 @@ function telaInicioGestor(perfil, rota) {
   const ehAdmin = perfil.papel === "admin";
   const aba = rota === "/equipe" ? "equipe" : rota === "/trocas" ? "trocas" : "pendentes";
   const titulos = {
-    pendentes: ["Pendentes", "Revezamentos esperando a sua decisão"],
+    pendentes: ["Pendentes", ehAdmin ? "Aprovados esperando conclusão" : "Para decidir ou concluir"],
     trocas: ["Todas as trocas", ehAdmin ? "Todas as equipes" : "Revezamentos da sua equipe"],
     equipe: [ehAdmin ? "Usuários" : "Minha equipe", ehAdmin ? "Gestores, colaboradores e RH" : "Colaboradores ligados a você"],
   };
   const estado = { trocas: null, usuarios: null, filtro: "todas", busca: "", papel: "todos" };
-  const pendentesDe = (lista) => (lista || []).filter((t) => t.etapa === "aguardando_gestor" && (ehAdmin || !(t.aprovacoes || {})[perfil.uid]));
+  // Pendentes = o que precisa de ação sua: decidir (só o gestor) ou concluir o que já foi aprovado (gestor e RH)
+  const pendentesDe = (lista) => (lista || []).filter((t) => t.etapa === "aprovada" ||
+    (!ehAdmin && t.etapa === "aguardando_gestor" && !(t.aprovacoes || {})[perfil.uid]));
   let main;
 
   function montar() {
@@ -919,7 +969,7 @@ function telaInicioGestor(perfil, rota) {
     if (aba === "pendentes") {
       const lista = pendentesDe(estado.trocas);
       return por(main, lista.length ? grade(lista)
-        : h("div", { class: "cartao vazio" }, h("b", {}, "Nada pendente"), "Quando dois colaboradores combinarem um revezamento, ele aparece aqui para sua aprovação."));
+        : h("div", { class: "cartao vazio" }, h("b", {}, "Nada pendente"), "Quando houver um revezamento para aprovar ou concluir, ele aparece aqui."));
     }
     por(main, todas());
   }
@@ -1167,9 +1217,20 @@ function desenhar() {
   const rota = rotaAtual();
   const p = estado.perfil;
 
+  if (abertoComoArquivo) {
+    return por(app, h("div", { class: "entrada" }, marca("Falta um passo"),
+      aviso("atencao", "O app foi aberto direto do arquivo (duplo clique no index.html). O login do Firebase só funciona por um endereço http://."),
+      h("p", {}, "No Windows, dê dois cliques no arquivo ", h("b", {}, "iniciar.bat"), ", que está na mesma pasta. Ele abre o app em ",
+        h("b", {}, "http://localhost:8080"), ". Deixe a janela preta aberta enquanto estiver usando."),
+      h("p", { class: "sub" }, "Para os colaboradores usarem, publique no Firebase Hosting ou no servidor da empresa (veja o LEIA-ME).")));
+  }
+  if (!firebaseCarregado) {
+    return por(app, h("div", { class: "entrada" }, marca("Sem conexão"),
+      aviso("erro", "Não foi possível carregar o Firebase. Verifique a internet (ou se a rede da empresa bloqueia www.gstatic.com) e recarregue a página.")));
+  }
   if (!configurado) {
-    return por(app, h("div", { class: "entrada" }, h("h1", {}, "Configuração pendente"),
-      aviso("atencao", "Preencha os dados do Firebase no início do arquivo script.js (veja o LEIA-ME).")));
+    return por(app, h("div", { class: "entrada" }, marca("Configuração pendente"),
+      aviso("atencao", "Preencha o bloco firebaseConfig no início do arquivo script.js com os dados do seu projeto Firebase (veja o LEIA-ME).")));
   }
   if (estado.usuario === undefined) return por(app, carregando());
   if (!estado.usuario) return rota === "/primeiro-acesso" ? telaPrimeiroAcesso() : telaLogin();
@@ -1187,7 +1248,7 @@ function desenhar() {
   telaInicioGestor(p, rota);
 }
 
-if (configurado) {
+if (pronto) {
   auth.onAuthStateChanged((u) => {
     estado.usuario = u;
     estado.perfil = undefined;
