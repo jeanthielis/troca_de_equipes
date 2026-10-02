@@ -42,6 +42,21 @@ a { color: inherit; }
 .titulos h1 { font-stretch: 80%; font-weight: 700; font-size: 20px; margin: 0; line-height: 1.15; }
 .titulos small { display: block; font-size: 12.5px; opacity: .75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topo-direita { display: flex; align-items: center; gap: 8px; }
+
+/* Sino de notificações */
+.sino { position: relative; background: none; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: 8px; line-height: 1; }
+.sino:active { background: rgba(255,255,255,.12); }
+.sino-icone { font-size: 20px; filter: grayscale(1) brightness(2.4); }
+.sino .badge { position: absolute; top: 0; right: 0; min-width: 18px; padding: 0 5px; font-size: 11px; line-height: 18px; background: var(--err); color: #fff; }
+.sino.tem-aviso .sino-icone { filter: none; }
+
+/* Central de notificações */
+.avisos .aviso-item { display: flex; align-items: center; gap: 12px; }
+.aviso-item .aviso-txt { flex: 1; min-width: 0; }
+.aviso-item p { margin: 0 0 2px; font-size: 15px; }
+.aviso-item .sub { display: block; font-size: 13px; line-height: 1.3; }
+.aviso-item .aviso-acao { font-size: 13.5px; font-weight: 600; color: var(--blue); white-space: nowrap; }
+.aviso-item.nao-lida { border-left: 4px solid var(--blue); background: var(--blue-soft); }
 .topo button.voltar, .topo .sair-celular { background: none; border: 0; color: inherit; font: inherit; cursor: pointer; border-radius: 8px; }
 .topo button.voltar { font-size: 22px; line-height: 1; padding: 6px 10px; }
 .topo .sair-celular { font-size: 14px; padding: 8px; }
@@ -210,6 +225,9 @@ input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible
   .btn-sair { background: none; border: 1px solid rgba(255,255,255,.25); color: inherit; font: inherit; font-size: 13.5px; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
 
   .com-lateral .cabecalho { position: sticky; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .com-lateral .sino:hover { background: var(--field); }
+  .com-lateral .sino-icone { filter: grayscale(1) brightness(.6); }
+  .com-lateral .sino.tem-aviso .sino-icone { filter: none; }
   .com-lateral .topo { background: transparent; color: var(--ink); padding: 22px 32px 18px; min-height: 0; max-width: 1180px; width: 100%; margin: 0 auto; }
   .com-lateral .titulos h1 { font-size: 28px; }
   .com-lateral .titulos small { font-size: 14px; color: var(--muted); opacity: 1; white-space: normal; }
