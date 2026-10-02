@@ -107,6 +107,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible
 .etiqueta.espera { background: var(--warn-soft); color: var(--warn); }
 .etiqueta.ok { background: var(--ok-soft); color: var(--ok); }
 .etiqueta.erro { background: var(--err-soft); color: var(--err); }
+.etiqueta.info { background: var(--blue-soft); color: var(--blue); }
 .etiqueta.neutro { background: var(--field); color: var(--muted); border: 1px solid var(--line); }
 
 /* ---------- Trocas ---------- */
