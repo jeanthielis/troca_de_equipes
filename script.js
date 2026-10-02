@@ -443,7 +443,9 @@ const Pdf = {
         { data: minhaData, entrada: eu.entrada, saida: eu.saida, justificativa: "FOLGA - TROCA DE ESCALA" },
         { justificativa: `COLABORADOR ${outro.nome} - ${outro.matricula} IRA TRABALHAR NO LUGAR` },
       ],
-      aPartir: minhaData, horarioAnterior: eu.horario, horarioNovo: eu.horario, gestor: eu.gestorNome,
+      // No revezamento não há mudança de horário: as linhas "a partir de",
+      // "horário anterior" e "novo horário" ficam em branco. Só o gestor é preenchido.
+      gestor: eu.gestorNome,
     });
     return [
       folha(troca.solicitante, troca.dataFolgaSolicitante, troca.parceiro),
