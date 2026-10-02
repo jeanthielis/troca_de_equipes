@@ -39,6 +39,10 @@ const configurado = Boolean(firebaseConfig && firebaseConfig.apiKey && firebaseC
 const pronto = configurado && firebaseCarregado && !abertoComoArquivo;
 const auth = pronto ? (firebase.initializeApp(firebaseConfig), firebase.auth()) : null;
 const db = pronto ? firebase.firestore() : null;
+
+// Cache no próprio aparelho: o Firebase guarda o que já baixou e, nas próximas vezes,
+// só traz o que mudou. Economiza dados e deixa o app mais rápido.
+if (db && db.enablePersistence) db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
 const agora = () => firebase.firestore.FieldValue.serverTimestamp();
 
 
@@ -99,6 +103,14 @@ function primeiroNome(nome) {
   return p.length > 1 ? `${f(p[0])} ${f(p[p.length - 1])}` : f(p[0] || "");
 }
 const linkDaTroca = (id) => `${location.origin}${location.pathname}#/t/${id}`;
+
+/** Soma dias a uma data no formato "2026-10-01". */
+function somarDias(iso, dias) {
+  const [a, m, d] = iso.split("-").map(Number);
+  const x = new Date(a, m - 1, d + dias);
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+}
+const inicioDoMes = () => hojeISO().slice(0, 8) + "01";
 const maiusculo = (s) => String(s || "").trim().toUpperCase();
 
 function senhaAleatoria() {
@@ -678,7 +690,144 @@ function telaTrocarSenha(perfil) {
   senha.focus();
 }
 
-/* ---------- 6.2 Colaborador ---------- */
+/* ---------- 6.2 Filtros e busca (usados pelas telas abaixo) ---------- */
+const SITUACOES = [
+  { id: "aguardando_parceiro", rotulo: "Aguardando colega" },
+  { id: "aguardando_gestor", rotulo: "Aguardando gestor" },
+  { id: "aprovada", rotulo: "Aprovada" },
+  { id: "concluida", rotulo: "Concluída" },
+  { id: "recusada", rotulo: "Recusada" },
+  { id: "cancelada", rotulo: "Cancelada" },
+];
+const PERIODOS = [
+  { id: "todos", rotulo: "Qualquer data" },
+  { id: "futuras", rotulo: "A partir de hoje" },
+  { id: "mes", rotulo: "Este mês" },
+  { id: "30", rotulo: "Últimos 30 dias" },
+  { id: "90", rotulo: "Últimos 90 dias" },
+  { id: "intervalo", rotulo: "Escolher período" },
+];
+const filtroVazio = () => ({ busca: "", situacoes: [], periodo: "todos", de: "", ate: "", equipe: "", gestor: "", mostrar: 20 });
+
+/** Intervalo de datas (de, até) do período escolhido. "" = sem limite. */
+function intervaloDe(f) {
+  const hoje = hojeISO();
+  if (f.periodo === "futuras") return [hoje, ""];
+  if (f.periodo === "mes") return [inicioDoMes(), ""];
+  if (f.periodo === "30") return [somarDias(hoje, -30), ""];
+  if (f.periodo === "90") return [somarDias(hoje, -90), ""];
+  if (f.periodo === "intervalo") return [f.de || "", f.ate || ""];
+  return ["", ""];
+}
+
+/** Aplica busca, situação, período, equipe e gestor a uma lista de trocas. */
+function filtrarTrocas(lista, f) {
+  const b = f.busca.trim().toUpperCase();
+  const [de, ate] = intervaloDe(f);
+  const pessoas = (t) => [t.solicitante, t.parceiro].filter(Boolean);
+  return lista.filter((t) => {
+    if (f.situacoes.length && !f.situacoes.includes(t.etapa)) return false;
+    if (de || ate) {
+      const datas = [t.dataFolgaSolicitante, t.dataFolgaParceiro].filter(Boolean);
+      // entra se pelo menos uma das folgas estiver dentro do período
+      if (!datas.some((d) => (!de || d >= de) && (!ate || d <= ate))) return false;
+    }
+    if (f.equipe && !pessoas(t).some((p) => p.equipe === f.equipe)) return false;
+    if (f.gestor && !pessoas(t).some((p) => p.gestorUid === f.gestor)) return false;
+    if (b && !pessoas(t).some((p) => p.nome.includes(b) || p.matricula.toUpperCase().includes(b))) return false;
+    return true;
+  });
+}
+
+/** Quantos filtros estão ativos (fora a busca, que já aparece escrita no campo). */
+function filtrosAtivos(f) {
+  return (f.situacoes.length ? 1 : 0) + (f.periodo !== "todos" ? 1 : 0) + (f.equipe ? 1 : 0) + (f.gestor ? 1 : 0);
+}
+
+/**
+ * Painel de filtros: busca sempre visível e o resto dentro de "Filtros", que fica recolhido.
+ * opts: { equipes, gestores } — listas opcionais, montadas a partir das trocas carregadas.
+ */
+function painelFiltros(f, opts, aoMudar) {
+  const aplicar = () => { f.mostrar = 20; atualizarResumo(); aoMudar(); };
+  const busca = h("input", { type: "search", placeholder: "Buscar por nome ou matrícula", value: f.busca });
+  let debounce;
+  busca.addEventListener("input", () => {
+    f.busca = busca.value;
+    clearTimeout(debounce);
+    debounce = setTimeout(aplicar, 200);
+  });
+
+  const marca = (lista, id, ligado) => (ligado ? [...lista, id] : lista.filter((x) => x !== id));
+  const situacoes = h("div", { class: "filtros" }, SITUACOES.map((x) => {
+    const b = h("button", { type: "button", "aria-pressed": String(f.situacoes.includes(x.id)) }, x.rotulo);
+    b.addEventListener("click", () => {
+      f.situacoes = marca(f.situacoes, x.id, !f.situacoes.includes(x.id));
+      b.setAttribute("aria-pressed", String(f.situacoes.includes(x.id)));
+      aplicar();
+    });
+    return b;
+  }));
+
+  const periodo = h("select", {}, PERIODOS.map((p) => h("option", { value: p.id, selected: p.id === f.periodo }, p.rotulo)));
+  const de = h("input", { type: "date", value: f.de });
+  const ate = h("input", { type: "date", value: f.ate });
+  const campoDe = campo("De", de), campoAte = campo("Até", ate);
+  const verIntervalo = () => { campoDe.hidden = campoAte.hidden = periodo.value !== "intervalo"; };
+  periodo.addEventListener("change", () => { f.periodo = periodo.value; verIntervalo(); aplicar(); });
+  de.addEventListener("change", () => { f.de = de.value; aplicar(); });
+  ate.addEventListener("change", () => { f.ate = ate.value; aplicar(); });
+  verIntervalo();
+
+  const seletor = (rotulo, valor, lista, aoEscolher, vazio) => {
+    if (!lista || lista.length < 2) return null;
+    const sel = h("select", {}, h("option", { value: "" }, vazio),
+      lista.map((x) => h("option", { value: x.id, selected: x.id === valor }, x.rotulo)));
+    sel.addEventListener("change", () => { aoEscolher(sel.value); aplicar(); });
+    return campo(rotulo, sel);
+  };
+
+  const limpar = h("button", { type: "button", class: "btn pequeno" }, "Limpar filtros");
+  limpar.addEventListener("click", () => {
+    Object.assign(f, filtroVazio());
+    busca.value = ""; periodo.value = "todos"; de.value = ""; ate.value = "";
+    situacoes.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", "false"));
+    painel.querySelectorAll(".campos-filtro select").forEach((sel) => { if (sel !== periodo) sel.value = ""; });
+    verIntervalo(); atualizarResumo(); aoMudar();
+  });
+
+  const resumo = h("summary", {}, "Filtros");
+  const atualizarResumo = () => {
+    const n = filtrosAtivos(f);
+    por(resumo, "Filtros", n ? h("span", { class: "badge" }, n) : null);
+  };
+  atualizarResumo();
+  const painel = h("details", { class: "painel-filtros", open: filtrosAtivos(f) > 0 }, resumo,
+    h("div", { class: "campos-filtro" },
+      campo("Situação", situacoes, { inteiro: true }),
+      campo("Período da folga", periodo), campoDe, campoAte,
+      seletor("Equipe", f.equipe, opts.equipes, (v) => { f.equipe = v; }, "Todas as equipes"),
+      seletor("Gestor", f.gestor, opts.gestores, (v) => { f.gestor = v; }, "Todos os gestores")),
+    h("div", { class: "acoes" }, limpar));
+  return h("div", { class: "busca-e-filtros" }, busca, painel);
+}
+
+/** Lista com "Mostrar mais": evita desenhar centenas de cartões de uma vez. */
+function listaComMais(lista, f, aoMudar, montar) {
+  const visiveis = lista.slice(0, f.mostrar);
+  const restam = lista.length - visiveis.length;
+  return [
+    h("p", { class: "sub contagem" }, lista.length === 0 ? "Nenhum resultado"
+      : lista.length === 1 ? "1 revezamento" : `${lista.length} revezamentos` + (restam ? ` · mostrando ${visiveis.length}` : "")),
+    montar(visiveis),
+    restam > 0 && h("button", { class: "btn bloco", onClick: () => { f.mostrar += 20; aoMudar(); } },
+      `Mostrar mais (${restam > 20 ? 20 : restam})`),
+  ];
+}
+
+/* ---------- 6.3 Colaborador ---------- */
+let filtroMeus = filtroVazio();
+
 function telaInicioColaborador(perfil) {
   const main = tela({
     titulo: primeiroNome(perfil.nome),
@@ -690,21 +839,40 @@ function telaInicioColaborador(perfil) {
   const area = h("div", { class: "pilha" }, carregando());
   mais(main, area);
 
+  const item = (t) => {
+    const outro = t.solicitanteUid === perfil.uid ? t.parceiro : t.solicitante;
+    return h("a", { class: "item", href: "#/t/" + t.id },
+      h("div", { class: "item-topo" }, h("b", {}, outro ? "Com " + primeiroNome(outro.nome) : "Aguardando um colega"), etiqueta(t.etapa)),
+      parDeFolgas(t, perfil.uid));
+  };
+
   guardar(Banco.ouvirTrocas(perfil, (trocas) => {
-    const ativas = trocas.filter((t) => t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor");
-    const encerradas = trocas.filter((t) => !ativas.includes(t));
-    const item = (t) => {
-      const outro = t.solicitanteUid === perfil.uid ? t.parceiro : t.solicitante;
-      return h("a", { class: "item", href: "#/t/" + t.id },
-        h("div", { class: "item-topo" }, h("b", {}, outro ? "Com " + primeiroNome(outro.nome) : "Aguardando um colega"), etiqueta(t.etapa)),
-        parDeFolgas(t, perfil.uid));
-    };
+    const aberta = (t) => t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor" || t.etapa === "aprovada";
+    const ativas = trocas.filter(aberta);
+    const anteriores = trocas.filter((t) => !aberta(t));
+    if (trocas.length === 0) {
+      return por(area, h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento ainda"),
+        "Toque em ", h("strong", {}, "Novo revezamento"), ", escolha o dia da sua folga e envie o link para o colega que vai trabalhar no seu lugar."));
+    }
     por(area,
-      trocas.length === 0 && h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento ainda"),
-        "Toque em ", h("strong", {}, "Novo revezamento"), ", escolha o dia da sua folga e envie o link para o colega que vai trabalhar no seu lugar."),
       ativas.length > 0 && [h("div", { class: "secao" }, "Em andamento"), h("div", { class: "grade" }, ativas.map(item))],
-      encerradas.length > 0 && [h("div", { class: "secao" }, "Anteriores"), h("div", { class: "grade" }, encerradas.map(item))]);
+      anteriores.length > 0 && [h("div", { class: "secao" }, "Anteriores"), historico(anteriores)]);
   }, () => por(area, aviso("erro", "Não foi possível carregar seus revezamentos."))));
+
+  /** Histórico do colaborador: mostra poucos de cada vez e, se houver muitos, ganha busca. */
+  function historico(lista) {
+    const f = filtroMeus;
+    const caixa = h("div", { class: "pilha" });
+    const atualizar = () => {
+      const r = filtrarTrocas(lista, f);
+      por(caixa, r.length ? listaComMais(r, f, atualizar, (v) => h("div", { class: "grade" }, v.map(item)))
+        : h("p", { class: "sub contagem" }, "Nenhum resultado com esses filtros."));
+    };
+    atualizar();
+    return lista.length > 5
+      ? h("div", { class: "pilha" }, painelFiltros(f, { equipes: [], gestores: [] }, atualizar), caixa)
+      : caixa;
+  }
 }
 
 function telaNovaTroca(perfil) {
@@ -736,7 +904,7 @@ function telaNovaTroca(perfil) {
   });
 }
 
-/* ---------- 6.3 Detalhe do revezamento (convite, aprovação, PDF) ---------- */
+/* ---------- 6.4 Detalhe do revezamento (convite, aprovação, PDF) ---------- */
 function telaTroca(perfil, id) {
   const base = { perfil, menu: menuDe(perfil, "/t/"), abas: false, voltar: () => ir("/") };
   let main = tela({ ...base, titulo: "Revezamento" });
@@ -929,15 +1097,9 @@ function telaTroca(perfil, id) {
   }
 }
 
-/* ---------- 6.4 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
-const FILTROS = [
-  { id: "todas", rotulo: "Todas", f: () => true },
-  { id: "andamento", rotulo: "Em andamento", f: (t) => t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor" },
-  { id: "aprovada", rotulo: "Aprovadas (a concluir)", f: (t) => t.etapa === "aprovada" },
-  { id: "concluida", rotulo: "Concluídas", f: (t) => t.etapa === "concluida" },
-  { id: "recusada", rotulo: "Recusadas", f: (t) => t.etapa === "recusada" },
-  { id: "cancelada", rotulo: "Canceladas", f: (t) => t.etapa === "cancelada" },
-];
+/* ---------- 6.5 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
+// Guardado fora da função para o gestor não perder os filtros ao abrir uma troca e voltar.
+let filtroTrocas = filtroVazio();
 
 function telaInicioGestor(perfil, rota) {
   const ehAdmin = perfil.papel === "admin";
@@ -947,7 +1109,7 @@ function telaInicioGestor(perfil, rota) {
     trocas: ["Todas as trocas", ehAdmin ? "Todas as equipes" : "Revezamentos da sua equipe"],
     equipe: [ehAdmin ? "Usuários" : "Minha equipe", ehAdmin ? "Gestores, colaboradores e RH" : "Colaboradores ligados a você"],
   };
-  const estado = { trocas: null, usuarios: null, filtro: "todas", busca: "", papel: "todos" };
+  const estado = { trocas: null, usuarios: null, buscaEquipe: "", papel: "todos" };
   // Pendentes = o que precisa de ação sua: decidir (só o gestor) ou concluir o que já foi aprovado (gestor e RH)
   const pendentesDe = (lista) => (lista || []).filter((t) => t.etapa === "aprovada" ||
     (!ehAdmin && t.etapa === "aguardando_gestor" && !(t.aprovacoes || {})[perfil.uid]));
@@ -982,30 +1144,30 @@ function telaInicioGestor(perfil, rota) {
         t.parceiro && t.etapa !== "cancelada" && botaoPdf(t, null, true)))));
   }
 
-  /** Botões de filtro (só um marcado por vez). */
-  function botoesFiltro(opcoes, atual, aoEscolher) {
-    const caixa = h("div", { class: "filtros" });
-    opcoes.forEach(([id, rotulo]) => mais(caixa, h("button", {
-      "aria-pressed": String(atual === id),
-      onClick: (e) => { caixa.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); aoEscolher(id); },
-    }, rotulo)));
-    return caixa;
+  /** Equipes e gestores que aparecem nas trocas carregadas, para montar os seletores. */
+  function opcoesDasTrocas() {
+    const equipes = new Set(), gestores = new Map();
+    estado.trocas.forEach((t) => [t.solicitante, t.parceiro].filter(Boolean).forEach((p) => {
+      if (p.equipe) equipes.add(p.equipe);
+      if (p.gestorUid) gestores.set(p.gestorUid, primeiroNome(p.gestorNome));
+    }));
+    return {
+      equipes: [...equipes].sort((a, b) => a.localeCompare(b, "pt-BR", { numeric: true })).map((e) => ({ id: e, rotulo: "Equipe " + e })),
+      gestores: ehAdmin ? [...gestores].sort((a, b) => a[1].localeCompare(b[1], "pt-BR")).map(([id, rotulo]) => ({ id, rotulo })) : [],
+    };
   }
 
   function todas() {
-    const busca = h("input", { type: "search", placeholder: "Buscar por nome ou matrícula", value: estado.busca });
-    const resultado = h("div", {});
+    const f = filtroTrocas;
+    const resultado = h("div", { class: "pilha" });
     const atualizar = () => {
-      const f = FILTROS.find((x) => x.id === estado.filtro).f;
-      const b = estado.busca.trim().toUpperCase();
-      const lista = estado.trocas.filter(f).filter((t) => !b || [t.solicitante.nome, t.solicitante.matricula, t.parceiro && t.parceiro.nome, t.parceiro && t.parceiro.matricula]
-        .some((v) => String(v || "").toUpperCase().includes(b)));
-      por(resultado, lista.length ? grade(lista) : h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento"), "Nada encontrado com esse filtro."));
+      const lista = filtrarTrocas(estado.trocas, f);
+      por(resultado, lista.length
+        ? listaComMais(lista, f, atualizar, grade)
+        : h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento"), "Nada encontrado com esses filtros. Tente limpar a busca ou escolher outro período."));
     };
-    busca.addEventListener("input", () => { estado.busca = busca.value; atualizar(); });
     atualizar();
-    return [h("div", { class: "barra-filtros" }, busca,
-      botoesFiltro(FILTROS.map((x) => [x.id, x.rotulo]), estado.filtro, (id) => { estado.filtro = id; atualizar(); })), resultado];
+    return [painelFiltros(f, opcoesDasTrocas(), atualizar), resultado];
   }
 
   function equipe() {
@@ -1014,12 +1176,14 @@ function telaInicioGestor(perfil, rota) {
       return h("div", { class: "cartao vazio" }, h("b", {}, "Ninguém cadastrado ainda"), "Use ", h("strong", {}, "Cadastrar"),
         ` para incluir ${ehAdmin ? "gestores e colaboradores" : "os colaboradores da sua equipe"}.`);
     }
-    const busca = h("input", { type: "search", placeholder: "Buscar por nome, matrícula ou gestor", value: estado.busca });
+    const busca = h("input", { type: "search", placeholder: "Buscar por nome, matrícula ou gestor", value: estado.buscaEquipe });
     const corpo = h("tbody", {});
+    const contagem = h("p", { class: "sub contagem" });
     const atualizar = () => {
-      const b = estado.busca.trim().toUpperCase();
+      const b = estado.buscaEquipe.trim().toUpperCase();
       const lista = estado.usuarios.filter((u) => (estado.papel === "todos" || u.papel === estado.papel) &&
         (!b || u.nome.includes(b) || u.matricula.toUpperCase().includes(b) || String(u.gestorNome || "").includes(b)));
+      contagem.textContent = lista.length === 1 ? "1 pessoa" : `${lista.length} pessoas`;
       if (!lista.length) return por(corpo, h("tr", {}, h("td", { colspan: "8", style: { padding: "20px", textAlign: "center" } }, "Ninguém encontrado.")));
       por(corpo, lista.map((u) => {
         const ehColab = u.papel === "colaborador";
@@ -1039,29 +1203,39 @@ function telaInicioGestor(perfil, rota) {
         return tr;
       }));
     };
-    busca.addEventListener("input", () => { estado.busca = busca.value; atualizar(); });
+    let debounce;
+    busca.addEventListener("input", () => { estado.buscaEquipe = busca.value; clearTimeout(debounce); debounce = setTimeout(atualizar, 200); });
+    const filtrosPapel = ehAdmin && h("div", { class: "filtros" },
+      [["todos", "Todos"], ["colaborador", "Colaborador"], ["gestor", "Gestor"], ["admin", "RH / Administrador"]].map(([id, rotulo]) => {
+        const b = h("button", { type: "button", "aria-pressed": String(estado.papel === id) }, rotulo);
+        b.addEventListener("click", () => {
+          estado.papel = id;
+          filtrosPapel.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+          atualizar();
+        });
+        return b;
+      }));
     atualizar();
     const cab = h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "Nome"), h("th", { class: "c-resumo" }, ""), h("th", {}, "Matrícula"),
       ehAdmin && h("th", {}, "Perfil"), h("th", {}, "Equipe"), ehAdmin && h("th", {}, "Gestor"), h("th", {}, "Situação")));
-    return [h("div", { class: "barra-filtros" }, busca,
-      ehAdmin && botoesFiltro([["todos", "Todos"], ["colaborador", "Colaborador"], ["gestor", "Gestor"], ["admin", "RH / Administrador"]], estado.papel,
-        (p) => { estado.papel = p; atualizar(); })),
-      h("table", { class: "tabela" }, cab, corpo)];
+    return [h("div", { class: "busca-e-filtros" }, busca, filtrosPapel), contagem, h("table", { class: "tabela" }, cab, corpo)];
   }
 
   montar();
-  guardar(Banco.ouvirTrocas(perfil, (t) => {
-    const antes = pendentesDe(estado.trocas).length;
-    estado.trocas = t;
-    if (pendentesDe(t).length !== antes) montar(); else if (aba !== "equipe") preencher();
-  }, () => por(main, aviso("erro", "Não foi possível carregar os revezamentos."))));
-  if (aba === "equipe") {
+  // A lista de trocas só é buscada nas abas que a usam: na aba Equipe, nada de trocas é baixado.
+  if (aba !== "equipe") {
+    guardar(Banco.ouvirTrocas(perfil, (t) => {
+      const antes = pendentesDe(estado.trocas).length;
+      estado.trocas = t;
+      if (pendentesDe(t).length !== antes) montar(); else preencher();
+    }, () => por(main, aviso("erro", "Não foi possível carregar os revezamentos."))));
+  } else {
     guardar(Banco.ouvirUsuarios(perfil, (u) => { estado.usuarios = u; preencher(); },
       () => por(main, aviso("erro", "Não foi possível carregar os cadastros."))));
   }
 }
 
-/* ---------- 6.5 Cadastro e edição de usuários ---------- */
+/* ---------- 6.6 Cadastro e edição de usuários ---------- */
 function telaUsuario(perfil, uidAlvo) {
   const ehAdmin = perfil.papel === "admin";
   const novo = uidAlvo === "novo";
