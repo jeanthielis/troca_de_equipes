@@ -61,6 +61,7 @@ const ETAPAS = {
   concluida: { rotulo: "Concluída", tom: "ok" },
   recusada: { rotulo: "Recusada", tom: "erro" },
   cancelada: { rotulo: "Cancelada", tom: "neutro" },
+  expirada: { rotulo: "Prazo vencido", tom: "erro" },
   pendente: { rotulo: "Pendente", tom: "espera" },
 };
 const PAPEIS = { colaborador: "Colaborador", gestor: "Gestor", admin: "RH / Administrador" };
@@ -107,6 +108,29 @@ function primeiroNome(nome) {
   const f = (w) => w.charAt(0) + w.slice(1).toLowerCase();
   return p.length > 1 ? `${f(p[0])} ${f(p[p.length - 1])}` : f(p[0] || "");
 }
+/** Quantos dias faltam para uma data ("2026-10-05"). Negativo se já passou. */
+function diasAte(iso) {
+  const [a, m, d] = iso.split("-").map(Number);
+  const alvo = new Date(a, m - 1, d);
+  const hoje = new Date();
+  return Math.round((alvo - new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate())) / 864e5);
+}
+
+/** "6h", "06:30", "18h" -> número de horas (6, 6.5, 18). null se não entender. */
+function horaEm(txt) {
+  const m = String(txt || "").trim().toUpperCase().replace(/\s/g, "").match(/^(\d{1,2})(?:[H:](\d{2}))?H?$/);
+  if (!m) return null;
+  const hora = Number(m[1]), min = Number(m[2] || 0);
+  return hora > 23 || min > 59 ? null : hora + min / 60;
+}
+
+/** Horas trabalhadas no dia, considerando turnos que viram a noite. */
+function duracaoJornada(entrada, saida) {
+  const e = horaEm(entrada), s2 = horaEm(saida);
+  if (e === null || s2 === null) return null;
+  return s2 > e ? s2 - e : 24 - e + s2;
+}
+
 /** "há 5 min", "ontem", "12/03" */
 function quandoRelativo(ms) {
   if (!ms) return "";
@@ -288,7 +312,16 @@ const Banco = {
     };
   },
 
-  async criarTroca(perfil, { dataFolga, entrada, saida, observacao }) {
+  /** Lista de colegas para o convite direcionado (só colaboradores ativos). */
+  ouvirColegas(perfil, cb, erro) {
+    return db.collection("usuarios").where("papel", "==", "colaborador").onSnapshot((s) => {
+      cb(s.docs.map((d) => ({ uid: d.id, ...d.data() }))
+        .filter((u) => u.ativo !== false && u.uid !== perfil.uid && u.gestorUid)
+        .sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR")));
+    }, erro);
+  },
+
+  async criarTroca(perfil, { dataFolga, entrada, saida, observacao, colega, expiraEm }) {
     const ref = await db.collection("trocas").add({
       tipo: "revezamento",
       etapa: "aguardando_parceiro",
@@ -296,6 +329,11 @@ const Banco = {
       solicitante: Banco.retrato(perfil, entrada, saida),
       dataFolgaSolicitante: dataFolga,
       parceiroUid: null, parceiro: null, dataFolgaParceiro: null,
+      // convite direcionado: só esta pessoa pode aceitar (null = qualquer colega com o link)
+      convidadoUid: colega ? colega.uid : null,
+      convidado: colega ? { nome: colega.nome, matricula: colega.matricula } : null,
+      // prazo para responder (as regras do banco impedem aceitar depois disso)
+      expiraEm: expiraEm || null,
       participantes: [perfil.uid],
       gestores: [perfil.gestorUid],
       aprovacoes: {},
@@ -486,8 +524,11 @@ const Pdf = {
 
   /** Gera o PDF e entrega: no celular abre o compartilhamento; no computador baixa o arquivo. */
   async baixar(troca) {
-    const bytes = await Pdf.gerar(Pdf.folhas(troca));
-    const nome = Pdf.nomeArquivo(troca);
+    const lista = Array.isArray(troca) ? troca : [troca];
+    const folhas = lista.flatMap((t) => Pdf.folhas(t));
+    const bytes = await Pdf.gerar(folhas);
+    const nome = lista.length === 1 ? Pdf.nomeArquivo(lista[0])
+      : `REVEZAMENTOS_${lista.length}_${hojeISO().split("-").reverse().join("-")}.pdf`;
     const blob = new Blob([bytes], { type: "application/pdf" });
     const arquivo = new File([blob], nome, { type: "application/pdf" });
     if (matchMedia("(pointer: coarse)").matches && navigator.canShare && navigator.canShare({ files: [arquivo] })) {
@@ -502,6 +543,101 @@ const Pdf = {
   },
 };
 
+
+/* =====================================================================
+   4.4 REGRAS DA ESCALA
+   Confere o que o próprio formulário exige: 11 horas de descanso entre
+   jornadas e proibição de trabalhar na folga. Também avisa quando duas
+   pessoas da mesma equipe folgam no mesmo dia.
+   ===================================================================== */
+const ETAPAS_VALEM = ["aguardando_parceiro", "aguardando_gestor", "aprovada", "concluida"];
+
+/** Quem folga e quem trabalha em cada data, numa troca. */
+function diasDaTroca(t) {
+  const dias = [];
+  if (t.solicitante && t.dataFolgaSolicitante) {
+    dias.push({ data: t.dataFolgaSolicitante, folga: { uid: t.solicitanteUid, p: t.solicitante }, trabalha: t.parceiro ? { uid: t.parceiroUid, p: t.parceiro } : null });
+  }
+  if (t.parceiro && t.dataFolgaParceiro) {
+    dias.push({ data: t.dataFolgaParceiro, folga: { uid: t.parceiroUid, p: t.parceiro }, trabalha: { uid: t.solicitanteUid, p: t.solicitante } });
+  }
+  return dias;
+}
+
+/**
+ * Procura problemas na troca, comparando com as outras já registradas.
+ * Devolve uma lista de { nivel: "alerta" | "atencao", texto }.
+ * "alerta" = contraria o formulário. "atencao" = vale conferir.
+ */
+function conflitosDaTroca(troca, outras) {
+  const achados = [];
+  const add = (nivel, texto) => { if (!achados.some((x) => x.texto === texto)) achados.push({ nivel, texto }); };
+  const demais = (outras || []).filter((t) => t.id !== troca.id && ETAPAS_VALEM.includes(t.etapa));
+  const meus = diasDaTroca(troca);
+
+  // o que cada pessoa já tem marcado nos outros revezamentos
+  const agenda = {}; // uid -> { folga: Set(datas), trabalha: Set(datas), pessoa }
+  const anota = (uid, pessoa, tipo, data) => {
+    if (!uid || !data) return;
+    agenda[uid] = agenda[uid] || { folga: new Set(), trabalha: new Set(), pessoa };
+    agenda[uid][tipo].add(data);
+  };
+  demais.forEach((t) => diasDaTroca(t).forEach((d) => {
+    if (d.folga) anota(d.folga.uid, d.folga.p, "folga", d.data);
+    if (d.trabalha) anota(d.trabalha.uid, d.trabalha.p, "trabalha", d.data);
+  }));
+
+  meus.forEach((d) => {
+    // 1) trabalhar num dia em que a pessoa já tem folga combinada
+    if (d.trabalha && agenda[d.trabalha.uid] && agenda[d.trabalha.uid].folga.has(d.data)) {
+      add("alerta", `${primeiroNome(d.trabalha.p.nome)} já tem folga combinada em ${dataBR(d.data)} e não pode trabalhar nesse dia.`);
+    }
+    // 2) folgar num dia em que a pessoa já se comprometeu a cobrir outro colega
+    if (d.folga && agenda[d.folga.uid] && agenda[d.folga.uid].trabalha.has(d.data)) {
+      add("alerta", `${primeiroNome(d.folga.p.nome)} já vai cobrir outro colega em ${dataBR(d.data)} e não pode folgar nesse dia.`);
+    }
+    // 3) duas pessoas da mesma equipe folgando no mesmo dia
+    if (d.folga && d.folga.p.equipe) {
+      Object.values(agenda).forEach((a) => {
+        if (a.pessoa.equipe === d.folga.p.equipe && a.pessoa.matricula !== d.folga.p.matricula && a.folga.has(d.data)) {
+          add("atencao", `${primeiroNome(a.pessoa.nome)}, da mesma equipe ${d.folga.p.equipe}, também folga em ${dataBR(d.data)}.`);
+        }
+      });
+    }
+    // 4) descanso de 11 horas entre jornadas, quando a pessoa cobre dias seguidos
+    if (d.trabalha) {
+      const a = agenda[d.trabalha.uid];
+      const vizinhos = [somarDias(d.data, -1), somarDias(d.data, 1)].filter((x) => a && a.trabalha.has(x));
+      const jornada = duracaoJornada(d.trabalha.p.entrada || d.trabalha.p.horario, d.trabalha.p.saida);
+      if (vizinhos.length && jornada !== null && 24 - jornada < 11) {
+        add("alerta", `${primeiroNome(d.trabalha.p.nome)} trabalharia em dias seguidos (${dataBR(vizinhos[0])} e ${dataBR(d.data)}) com menos de 11 horas de descanso entre as jornadas.`);
+      } else if (vizinhos.length) {
+        add("atencao", `${primeiroNome(d.trabalha.p.nome)} trabalharia em dias seguidos: ${dataBR(vizinhos[0])} e ${dataBR(d.data)}. Confira o descanso de 11 horas.`);
+      }
+    }
+  });
+
+  // 5) dentro da própria troca: jornada longa demais para o descanso de 11 horas
+  [troca.solicitante, troca.parceiro].filter(Boolean).forEach((p) => {
+    const j = duracaoJornada(p.entrada, p.saida);
+    if (j !== null && j > 13) {
+      const horas = Math.floor(j), min = Math.round((j - horas) * 60);
+      add("atencao", `A jornada de ${primeiroNome(p.nome)} (${horas}h${min ? String(min).padStart(2, "0") : ""}) deixa menos de 11 horas até o dia seguinte.`);
+    }
+  });
+
+  return achados;
+}
+
+/** Caixa com os avisos das regras. */
+function caixaConflitos(lista, titulo) {
+  if (!lista.length) return null;
+  const grave = lista.some((x) => x.nivel === "alerta");
+  return h("div", { class: "cartao pilha conflitos " + (grave ? "grave" : "") , style: { gap: "8px" } },
+    h("h2", {}, titulo || (grave ? "Atenção: confira antes de seguir" : "Pontos para conferir")),
+    h("ul", { class: "lista-conflitos" }, lista.map((x) => h("li", { class: x.nivel }, x.texto))),
+    h("p", { class: "sub" }, "Regras do formulário: descanso de 11 horas entre jornadas e proibição de trabalhar na folga."));
+}
 
 /* =====================================================================
    4.5 CENTRAL DE NOTIFICAÇÕES
@@ -557,6 +693,24 @@ const Notificacoes = {
         if (t.etapa === "recusada") add(t, "Seu revezamento foi recusado pelo gestor.", "Ver motivo");
         if (t.etapa === "concluida") add(t, "Revezamento concluído. O documento já foi gerado.", "Ver pedido");
         if (t.etapa === "cancelada" && souParceiro) add(t, `${outro} cancelou o revezamento.`, "Ver pedido");
+      }
+      // lembrete da véspera e do dia, para quem folga e para quem cobre
+      if ((souSolicitante || souParceiro) && (t.etapa === "aprovada" || t.etapa === "concluida")) {
+        diasDaTroca(t).forEach((d) => {
+          const quantos = diasAte(d.data);
+          if (quantos !== 0 && quantos !== 1) return;
+          const amanha = quantos === 1 ? "Amanhã" : "Hoje";
+          if (d.folga && d.folga.uid === perfil.uid) {
+            avisos.push({ chave: `${t.id}:folga:${d.data}`, id: t.id, ms: Date.now(), acao: "Ver pedido",
+              texto: `${amanha} (${dataBR(d.data)}) é a sua folga do revezamento. ${d.trabalha ? primeiroNome(d.trabalha.p.nome) + " cobre você." : ""}`.trim(),
+              detalhe: "Lembrete" });
+          }
+          if (d.trabalha && d.trabalha.uid === perfil.uid) {
+            avisos.push({ chave: `${t.id}:cobre:${d.data}`, id: t.id, ms: Date.now(), acao: "Ver pedido",
+              texto: `${amanha} (${dataBR(d.data)}) você trabalha no lugar de ${primeiroNome(d.folga.p.nome)}.`,
+              detalhe: "Lembrete" });
+          }
+        });
       }
       if (souGestor && t.etapa === "aguardando_gestor" && !(t.aprovacoes || {})[perfil.uid]) {
         add(t, `${dupla} combinaram um revezamento e aguardam a sua aprovação.`, "Aprovar");
@@ -643,6 +797,7 @@ function menuDe(perfil, rota, pendentes) {
   }
   return [
     { rotulo: "Pendentes", href: "#/", ativo: rota === "/", badge: pendentes || null },
+    { rotulo: "Calendário", href: "#/calendario", ativo: rota === "/calendario" },
     { rotulo: "Todas as trocas", href: "#/trocas", ativo: rota === "/trocas" },
     { rotulo: perfil.papel === "admin" ? "Usuários" : "Minha equipe", href: "#/equipe", ativo: rota === "/equipe" || rota.startsWith("/usuario/") },
   ];
@@ -707,6 +862,9 @@ function toast(msg) {
   clearTimeout(timerToast);
   timerToast = setTimeout(() => t.remove(), 3200);
 }
+
+/** Situação mostrada na tela (leva o prazo vencido em conta). */
+const situacaoDe = (t) => (expirada(t) ? "expirada" : t.etapa);
 
 function etiqueta(etapa) {
   const e = ETAPAS[etapa] || { rotulo: etapa, tom: "neutro" };
@@ -852,6 +1010,7 @@ const SITUACOES = [
   { id: "concluida", rotulo: "Concluída" },
   { id: "recusada", rotulo: "Recusada" },
   { id: "cancelada", rotulo: "Cancelada" },
+  { id: "expirada", rotulo: "Prazo vencido" },
 ];
 const PERIODOS = [
   { id: "todos", rotulo: "Qualquer data" },
@@ -880,7 +1039,7 @@ function filtrarTrocas(lista, f) {
   const [de, ate] = intervaloDe(f);
   const pessoas = (t) => [t.solicitante, t.parceiro].filter(Boolean);
   return lista.filter((t) => {
-    if (f.situacoes.length && !f.situacoes.includes(t.etapa)) return false;
+    if (f.situacoes.length && !f.situacoes.includes(situacaoDe(t))) return false;
     if (de || ate) {
       const datas = [t.dataFolgaSolicitante, t.dataFolgaParceiro].filter(Boolean);
       // entra se pelo menos uma das folgas estiver dentro do período
@@ -1024,12 +1183,12 @@ function telaInicioColaborador(perfil) {
   const item = (t) => {
     const outro = t.solicitanteUid === perfil.uid ? t.parceiro : t.solicitante;
     return h("a", { class: "item", href: "#/t/" + t.id },
-      h("div", { class: "item-topo" }, h("b", {}, outro ? "Com " + primeiroNome(outro.nome) : "Aguardando um colega"), etiqueta(t.etapa)),
+      h("div", { class: "item-topo" }, h("b", {}, outro ? "Com " + primeiroNome(outro.nome) : "Aguardando um colega"), etiqueta(situacaoDe(t))),
       parDeFolgas(t, perfil.uid));
   };
 
   guardar(Banco.ouvirTrocas(perfil, (trocas) => {
-    const aberta = (t) => t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor" || t.etapa === "aprovada";
+    const aberta = (t) => !expirada(t) && (t.etapa === "aguardando_parceiro" || t.etapa === "aguardando_gestor" || t.etapa === "aprovada");
     const ativas = trocas.filter(aberta);
     const anteriores = trocas.filter((t) => !aberta(t));
     if (trocas.length === 0) {
@@ -1065,30 +1224,92 @@ function telaInicioColaborador(perfil) {
 function telaNovaTroca(perfil) {
   const main = tela({ titulo: "Novo revezamento", sub: "Escolha o dia da sua folga", voltar: () => ir("/"), perfil, menu: menuDe(perfil, "/nova"), abas: false });
   if (!perfil.gestorUid) return mais(main, aviso("atencao", "Seu cadastro ainda não está ligado a um gestor. Procure o RH."));
+
   const data = h("input", { type: "date", min: hojeISO() });
   const entrada = h("input", { value: perfil.entrada || "", placeholder: "6h" });
   const saida = h("input", { value: perfil.saida || "", placeholder: "18h" });
   const obs = h("textarea", { maxLength: 300, placeholder: "Algum detalhe para o gestor" });
+  const colega = h("select", {}, h("option", { value: "" }, "Carregando colegas…"));
+  const prazo = h("select", {},
+    h("option", { value: "vespera" }, "Até a véspera da folga"),
+    h("option", { value: "3" }, "Em 3 dias"),
+    h("option", { value: "7" }, "Em 7 dias"),
+    h("option", { value: "" }, "Sem prazo"));
   const erro = caixaErro();
-  const botao = h("button", { class: "btn primario bloco" }, "Criar e gerar link");
+  const alertas = h("div", {});
+  const botao = h("button", { class: "btn primario bloco" }, "Criar e enviar convite");
+
+  let colegas = [];
+  let minhasTrocas = [];
+  guardar(Banco.ouvirColegas(perfil, (lista) => {
+    colegas = lista;
+    const atual = colega.value;
+    por(colega, h("option", { value: "" }, "Qualquer colega com o link"),
+      lista.map((c) => h("option", { value: c.uid }, `${c.nome} — mat. ${c.matricula}${c.equipe ? " · equipe " + c.equipe : ""}`)));
+    colega.value = atual;
+  }, () => por(colega, h("option", { value: "" }, "Qualquer colega com o link"))));
+  guardar(Banco.ouvirTrocas(perfil, (t) => { minhasTrocas = t; conferir(); }, () => {}));
+
+  /** Mostra os avisos das regras já na hora de preencher. */
+  function conferir() {
+    if (!data.value) return por(alertas);
+    const escolhido = colegas.find((c) => c.uid === colega.value);
+    const previa = {
+      id: "nova",
+      etapa: "aguardando_gestor",
+      solicitanteUid: perfil.uid,
+      solicitante: { ...perfil, entrada: entrada.value, saida: saida.value },
+      dataFolgaSolicitante: data.value,
+      parceiroUid: escolhido ? escolhido.uid : null,
+      parceiro: escolhido || null,
+      dataFolgaParceiro: null,
+      gestores: [perfil.gestorUid],
+    };
+    por(alertas, caixaConflitos(conflitosDaTroca(previa, minhasTrocas), "Confira antes de enviar"));
+  }
+  [data, entrada, saida].forEach((el) => el.addEventListener("change", conferir));
+  colega.addEventListener("change", conferir);
+
   const form = h("form", { class: "cartao pilha form-largo", novalidate: true },
     h("p", { class: "sub" }, "No dia da sua folga, o colega trabalha no seu lugar. Depois ele escolhe o dia da folga dele, e nesse dia você trabalha no lugar dele."),
-    h("div", { class: "campos" }, campo("Dia da minha folga", data, { inteiro: true }),
+    h("div", { class: "campos" },
+      campo("Dia da minha folga", data, { inteiro: true }),
       campo("Entrada", entrada, { ajuda: "Seu horário nesse dia" }), campo("Saída", saida),
+      campo("Convidar", colega, { inteiro: true, ajuda: "Escolhendo o colega, só ele consegue aceitar o convite." }),
+      campo("Prazo para responder", prazo, { inteiro: true, ajuda: "Depois do prazo o convite não pode mais ser aceito." }),
       campo("Observação (opcional)", obs, { inteiro: true })),
-    erro, botao);
+    alertas, erro, botao);
   mais(main, form);
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!data.value) return erro.mostrar("Escolha o dia da sua folga.");
     if (data.value < hojeISO()) return erro.mostrar("O dia da folga não pode estar no passado.");
+    const escolhido = colegas.find((c) => c.uid === colega.value) || null;
     erro.mostrar(""); botao.disabled = true; botao.textContent = "Criando…";
     try {
-      const id = await Banco.criarTroca(perfil, { dataFolga: data.value, entrada: entrada.value, saida: saida.value, observacao: obs.value });
-      toast("Pedido criado. Agora envie o link ao colega.");
+      const id = await Banco.criarTroca(perfil, {
+        dataFolga: data.value, entrada: entrada.value, saida: saida.value, observacao: obs.value,
+        colega: escolhido, expiraEm: prazoEm(prazo.value, data.value),
+      });
+      toast(escolhido ? "Convite criado. Avise o colega pelo link." : "Pedido criado. Agora envie o link ao colega.");
       ir("/t/" + id);
-    } catch (err) { erro.mostrar(mensagemErro(err)); botao.disabled = false; botao.textContent = "Criar e gerar link"; }
+    } catch (err) { erro.mostrar(mensagemErro(err)); botao.disabled = false; botao.textContent = "Criar e enviar convite"; }
   });
+}
+
+/** Data-limite para aceitar o convite, como data e hora do banco. */
+function prazoEm(opcao, dataFolga) {
+  if (!opcao) return null;
+  const dia = opcao === "vespera" ? somarDias(dataFolga, -1) : somarDias(hojeISO(), Number(opcao));
+  const limite = opcao === "vespera" && dia < hojeISO() ? dataFolga : dia;
+  const [a, m, d] = limite.split("-").map(Number);
+  return firebase.firestore.Timestamp.fromDate(new Date(a, m - 1, d, 23, 59, 59));
+}
+
+/** O convite venceu? */
+function expirada(t) {
+  return t.etapa === "aguardando_parceiro" && t.expiraEm && t.expiraEm.toMillis && t.expiraEm.toMillis() < Date.now();
 }
 
 /* ---------- 6.5 Detalhe do revezamento (convite, aprovação, PDF) ---------- */
@@ -1097,6 +1318,8 @@ function telaTroca(perfil, id) {
   let main = tela({ ...base, titulo: "Revezamento" });
   mais(main, carregando());
   // o que foi digitado sobrevive às atualizações em tempo real
+  let listaDeTrocas = [];
+  guardar(Banco.ouvirTrocas(perfil, (t) => { listaDeTrocas = t; }, () => {}));
   const memoria = { dataFolga: "", entrada: perfil.entrada || "", saida: perfil.saida || "", recusando: false, motivo: "", confirmarCancelar: false, confirmarConcluir: false };
 
   guardar(Banco.ouvirTroca(id, desenhar, () => desenhar(null)));
@@ -1109,16 +1332,29 @@ function telaTroca(perfil, id) {
     const souSolicitante = troca.solicitanteUid === perfil.uid;
     const souParceiro = troca.parceiroUid === perfil.uid;
     const souGestor = perfil.papel === "gestor" && troca.gestores.includes(perfil.uid);
-    const ehConvite = !souSolicitante && !souParceiro && perfil.papel === "colaborador" && troca.etapa === "aguardando_parceiro";
+    const souConvidado = !troca.convidadoUid || troca.convidadoUid === perfil.uid;
+    const ehConvite = !souSolicitante && !souParceiro && perfil.papel === "colaborador"
+      && troca.etapa === "aguardando_parceiro" && !expirada(troca) && souConvidado;
     const erro = caixaErro();
-    main = tela({ ...base, titulo: ehConvite ? "Convite de revezamento" : "Revezamento", sub: "Pedido de " + primeiroNome(troca.solicitante.nome), direita: etiqueta(troca.etapa) });
+    main = tela({ ...base, titulo: ehConvite ? "Convite de revezamento" : "Revezamento", sub: "Pedido de " + primeiroNome(troca.solicitante.nome), direita: etiqueta(situacaoDe(troca)) });
 
-    if (ehConvite) return mais(main, erro, h("div", { class: "form-largo" }, convite(troca, erro)));
+    if (ehConvite) return mais(main, erro, h("div", { class: "form-largo pilha" }, convite(troca, erro)));
+    if (!souSolicitante && !souParceiro && perfil.papel === "colaborador") {
+      // alguém abriu o link, mas o convite não é para essa pessoa, já venceu ou já foi aceito
+      return mais(main, aviso("atencao", expirada(troca) ? "O prazo deste convite venceu."
+        : !souConvidado ? `Este convite é para ${primeiroNome((troca.convidado || {}).nome || "outro colega")}.`
+        : "Este convite já foi aceito por outra pessoa ou foi cancelado."));
+    }
 
     const ativa = troca.etapa === "aguardando_parceiro" || troca.etapa === "aguardando_gestor";
     const esquerda = h("div", { class: "pilha" },
       h("div", { class: "cartao pilha" }, parDeFolgas(troca, perfil.uid), pessoas(troca),
+        troca.convidado && troca.etapa === "aguardando_parceiro" &&
+          h("p", { class: "sub" }, h("b", {}, "Convite enviado a: "), `${troca.convidado.nome} (mat. ${troca.convidado.matricula})`),
+        troca.expiraEm && troca.etapa === "aguardando_parceiro" &&
+          h("p", { class: "sub" }, h("b", {}, expirada(troca) ? "Prazo venceu em: " : "Prazo para responder: "), quando(troca.expiraEm)),
         troca.observacao && h("p", { class: "sub" }, h("b", {}, "Observação: "), troca.observacao)),
+      caixaConflitos(conflitosDaTroca(troca, listaDeTrocas), souGestor || perfil.papel === "admin" ? "Confira antes de aprovar" : null),
       andamento(troca));
     const direita = h("div", { class: "pilha" },
       souSolicitante && troca.etapa === "aguardando_parceiro" && compartilhar(troca),
@@ -1195,6 +1431,7 @@ function telaTroca(perfil, id) {
     const entrada = ligar(h("input", { placeholder: "6h" }), "entrada");
     const saida = ligar(h("input", { placeholder: "18h" }), "saida");
     const botao = h("button", { class: "btn primario bloco" }, "Aceitar revezamento");
+    const alertasConvite = h("div", {});
     const form = h("form", { class: "cartao pilha", novalidate: true },
       h("div", { class: "pessoa" }, iniciais(s.nome), h("div", {}, h("div", { class: "nome" }, s.nome), h("div", { class: "meta" }, `Mat. ${s.matricula}${s.equipe ? " · Equipe " + s.equipe : ""}`))),
       h("p", { style: { margin: 0 } }, h("b", {}, nome), " quer revezar com você. No dia ", h("b", {}, dataBR(troca.dataFolgaSolicitante)),
@@ -1204,7 +1441,15 @@ function telaTroca(perfil, id) {
       troca.observacao && h("p", { class: "sub" }, h("b", {}, "Observação: "), troca.observacao),
       h("div", { class: "campos" }, campo("Dia da minha folga", data, { inteiro: true }),
         campo("Entrada", entrada, { ajuda: "Seu horário nesse dia" }), campo("Saída", saida)),
-      botao);
+      alertasConvite, botao);
+    const conferir = () => {
+      if (!memoria.dataFolga) return por(alertasConvite);
+      const previa = { ...troca, id: "previa", etapa: "aguardando_gestor", parceiroUid: perfil.uid,
+        parceiro: { ...perfil, entrada: memoria.entrada, saida: memoria.saida }, dataFolgaParceiro: memoria.dataFolga };
+      por(alertasConvite, caixaConflitos(conflitosDaTroca(previa, listaDeTrocas), "Confira antes de aceitar"));
+    };
+    [data, entrada, saida].forEach((el) => el.addEventListener("change", conferir));
+    conferir();
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       if (!memoria.dataFolga) return erro.mostrar("Escolha o dia da sua folga.");
@@ -1284,23 +1529,94 @@ function telaTroca(perfil, id) {
   }
 }
 
-/* ---------- 6.6 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
+/* ---------- 6.6 Calendário da equipe ---------- */
+const MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+const DIAS_CURTOS = ["D", "S", "T", "Q", "Q", "S", "S"];
+
+/** Grade do mês com as folgas e coberturas. Devolve o elemento pronto. */
+function calendario(trocas, aoAbrirTroca) {
+  const hoje = hojeISO();
+  let mes = Number(hoje.slice(5, 7)) - 1, ano = Number(hoje.slice(0, 4));
+  let diaAberto = hoje;
+  const caixa = h("div", { class: "pilha" });
+
+  const porDia = () => {
+    const mapa = {};
+    trocas.filter((t) => ETAPAS_VALEM.includes(t.etapa) && !expirada(t)).forEach((t) => {
+      diasDaTroca(t).forEach((d) => {
+        if (!d.folga) return;
+        (mapa[d.data] = mapa[d.data] || []).push({
+          troca: t, folga: d.folga.p, trabalha: d.trabalha ? d.trabalha.p : null, etapa: t.etapa,
+        });
+      });
+    });
+    return mapa;
+  };
+
+  function montar() {
+    const mapa = porDia();
+    const primeiro = new Date(ano, mes, 1);
+    const inicio = primeiro.getDay();
+    const total = new Date(ano, mes + 1, 0).getDate();
+    const iso = (d) => `${ano}-${String(mes + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+
+    const celulas = [];
+    for (let i = 0; i < inicio; i++) celulas.push(h("div", { class: "cel vazia" }));
+    for (let d = 1; d <= total; d++) {
+      const data = iso(d), eventos = mapa[data] || [];
+      const cel = h("button", {
+        type: "button",
+        class: "cel" + (data === hoje ? " hoje" : "") + (data === diaAberto ? " aberta" : "") + (eventos.length ? " tem" : ""),
+        onClick: () => { diaAberto = data; montar(); },
+      }, h("span", { class: "num" }, d),
+        eventos.length ? h("span", { class: "pontos" }, eventos.slice(0, 3).map(() => h("i", {}))) : null);
+      celulas.push(cel);
+    }
+
+    const titulo = h("div", { class: "cal-topo" },
+      h("button", { class: "btn pequeno", type: "button", onClick: () => { mes--; if (mes < 0) { mes = 11; ano--; } montar(); } }, "‹"),
+      h("b", {}, `${MESES[mes].charAt(0).toUpperCase() + MESES[mes].slice(1)} de ${ano}`),
+      h("button", { class: "btn pequeno", type: "button", onClick: () => { mes++; if (mes > 11) { mes = 0; ano++; } montar(); } }, "›"));
+
+    const eventosDoDia = mapa[diaAberto] || [];
+    const detalhe = h("div", { class: "cartao pilha", style: { gap: "10px" } },
+      h("h2", {}, dataBR(diaAberto) + " · " + diaSemana(diaAberto)),
+      eventosDoDia.length
+        ? h("div", { class: "pilha", style: { gap: "8px" } }, eventosDoDia.map((e) => h("button", {
+            class: "linha-dia", type: "button", onClick: () => aoAbrirTroca(e.troca.id),
+          }, iniciais(e.folga.nome),
+            h("div", { class: "linha-txt" },
+              h("b", {}, primeiroNome(e.folga.nome) + " folga"),
+              h("span", { class: "sub" }, e.trabalha ? "Cobre: " + primeiroNome(e.trabalha.nome) : "Cobertura a definir")),
+            etiqueta(e.etapa))))
+        : h("p", { class: "sub" }, "Ninguém folga por revezamento neste dia."));
+
+    por(caixa, h("div", { class: "cartao pilha", style: { gap: "10px" } }, titulo,
+      h("div", { class: "cal-grade" }, DIAS_CURTOS.map((x, i) => h("span", { class: "cab-dia", key: i }, x)), celulas)), detalhe);
+  }
+  montar();
+  return caixa;
+}
+
+/* ---------- 6.7 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
 // Guardado fora da função para o gestor não perder os filtros ao abrir uma troca e voltar.
 let filtroTrocas = filtroVazio();
 let filtroPendentes = filtroVazio();
 
 function telaInicioGestor(perfil, rota) {
   const ehAdmin = perfil.papel === "admin";
-  const aba = rota === "/equipe" ? "equipe" : rota === "/trocas" ? "trocas" : "pendentes";
+  const aba = rota === "/equipe" ? "equipe" : rota === "/trocas" ? "trocas" : rota === "/calendario" ? "calendario" : "pendentes";
   const titulos = {
     pendentes: ["Pendentes", ehAdmin ? "Aprovados esperando conclusão" : "Para decidir ou concluir"],
     trocas: ["Todas as trocas", ehAdmin ? "Todas as equipes" : "Revezamentos da sua equipe"],
     equipe: [ehAdmin ? "Usuários" : "Minha equipe", ehAdmin ? "Gestores, colaboradores e RH" : "Colaboradores ligados a você"],
+    calendario: ["Calendário", ehAdmin ? "Folgas de todas as equipes" : "Folgas e coberturas da sua equipe"],
   };
   const estado = { trocas: null, usuarios: null, buscaEquipe: "", papel: "todos" };
   // Pendentes = o que precisa de ação sua: decidir (só o gestor) ou concluir o que já foi aprovado (gestor e RH)
   const pendentesDe = (lista) => (lista || []).filter((t) => t.etapa === "aprovada" ||
     (!ehAdmin && t.etapa === "aguardando_gestor" && !(t.aprovacoes || {})[perfil.uid]));
+  const temConflito = (t) => conflitosDaTroca(t, estado.trocas || []).some((x) => x.nivel === "alerta");
   let main;
 
   function montar() {
@@ -1316,15 +1632,57 @@ function telaInicioGestor(perfil, rota) {
   function preencher() {
     if (aba === "equipe") return por(main, equipe());
     if (estado.trocas === null) return por(main, carregando());
+    if (aba === "calendario") return por(main, calendario(estado.trocas, (id) => ir("/t/" + id)));
     if (aba === "pendentes") return por(main, pendentes());
     por(main, todas());
   }
 
+  /** Seleção para baixar vários PDFs de uma vez. */
+  const selecao = new Set();
+  const podeEntrarNoLote = (t) => t.parceiro && t.etapa !== "cancelada" && t.etapa !== "recusada";
+
+  function barraLote(lista) {
+    const podem = lista.filter(podeEntrarNoLote);
+    if (podem.length < 2) return null;
+    const barra = h("div", { class: "barra-lote" });
+    barra.atualizar = () => {
+      const marcados = podem.filter((t) => selecao.has(t.id));
+      const todos = h("button", { class: "btn pequeno", type: "button",
+        onClick: () => {
+          const ligar = marcados.length < podem.length;
+          podem.forEach((t) => (ligar ? selecao.add(t.id) : selecao.delete(t.id)));
+          main.querySelectorAll(".marcar input").forEach((c) => { c.checked = selecao.has(c.dataset.troca); });
+          barra.atualizar();
+        } }, marcados.length < podem.length ? "Marcar todos" : "Desmarcar todos");
+      if (!marcados.length) return por(barra, h("span", { class: "sub" }, "Marque os revezamentos para baixar os PDFs juntos."), todos);
+      const baixar = h("button", { class: "btn primario pequeno", type: "button" }, `Baixar ${marcados.length} em um PDF`);
+      baixar.addEventListener("click", async () => {
+        baixar.disabled = true; baixar.textContent = "Gerando…";
+        try { await Pdf.baixar(marcados); toast(`PDF com ${marcados.length} revezamentos gerado.`); }
+        catch (err) { toast("Não foi possível gerar: " + (err.message || err)); }
+        finally { barra.atualizar(); }
+      });
+      por(barra, h("span", { class: "sub" }, `${marcados.length} marcados`), todos, baixar);
+    };
+    barra.atualizar();
+    barraAtual = barra;
+    return barra;
+  }
+  let barraAtual = null;
+
   function grade(lista) {
     return h("div", { class: "grade" }, lista.map((t) => h("a", { class: "item", href: "#/t/" + t.id },
-      h("div", { class: "item-topo" }, h("b", {}, primeiroNome(t.solicitante.nome) + (t.parceiro ? " ⇄ " + primeiroNome(t.parceiro.nome) : "")), etiqueta(t.etapa)),
+      h("div", { class: "item-topo" }, h("b", {}, primeiroNome(t.solicitante.nome) + (t.parceiro ? " ⇄ " + primeiroNome(t.parceiro.nome) : "")), etiqueta(situacaoDe(t))),
       parDeFolgas(t),
+      t.etapa === "aguardando_gestor" && temConflito(t) && h("p", { class: "marca-conflito" }, "⚠ Confira as regras da escala"),
       h("div", { class: "item-rodape" }, h("span", { class: "sub" }, "Pedido em " + quando(t.criadoEm)),
+        podeEntrarNoLote(t) && h("label", {
+          class: "marcar", onClick: (e) => { e.stopPropagation(); },
+        }, h("input", { type: "checkbox", checked: selecao.has(t.id), "data-troca": t.id,
+          onChange: (e) => {
+            if (e.target.checked) selecao.add(t.id); else selecao.delete(t.id);
+            if (barraAtual) barraAtual.atualizar();
+          } }), "PDF em lote"),
         t.parceiro && t.etapa !== "cancelada" && botaoPdf(t, null, true)))));
   }
 
@@ -1360,6 +1718,7 @@ function telaInicioGestor(perfil, rota) {
     atualizar();
     return [
       h("div", { class: "secao" }, lista.length ? `Para resolver (${lista.length})` : "Para resolver"),
+      barraLote(lista),
       lista.length ? grade(lista)
         : h("div", { class: "cartao vazio" }, h("b", {}, "Nada pendente"), "Quando houver um revezamento para aprovar ou concluir, ele aparece aqui."),
       outros.length > 0 && h("div", { class: "secao" }, "Buscar nos demais"),
@@ -1374,7 +1733,7 @@ function telaInicioGestor(perfil, rota) {
     const atualizar = () => {
       const lista = filtrarTrocas(estado.trocas, f);
       por(resultado, lista.length
-        ? listaComMais(lista, f, atualizar, grade)
+        ? [barraLote(lista), listaComMais(lista, f, atualizar, grade)]
         : h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento"), "Nada encontrado com esses filtros. Tente limpar a busca ou escolher outro período."));
     };
     atualizar();
@@ -1446,7 +1805,7 @@ function telaInicioGestor(perfil, rota) {
   }
 }
 
-/* ---------- 6.7 Cadastro e edição de usuários ---------- */
+/* ---------- 6.8 Cadastro e edição de usuários ---------- */
 function telaUsuario(perfil, uidAlvo) {
   const ehAdmin = perfil.papel === "admin";
   const novo = uidAlvo === "novo";
