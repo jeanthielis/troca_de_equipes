@@ -29,6 +29,11 @@ const firebaseConfig = {
 const DOMINIO_LOGIN = "colaboradores.troca-escala.app";
 
 const EMPRESAS = ["BIANCOGRES", "LM COMÉRCIO"];
+
+// Redefinição de senha pelo gestor/RH. Precisa da função "redefinirSenha" publicada
+// (pasta funcao-redefinir-senha). Deixe false enquanto ela não estiver no ar.
+const USAR_REDEFINICAO = false;
+const REGIAO_FUNCOES = "southamerica-east1";
 const MODELO_PDF = "modelo-un-fo-spe-023.pdf";
 
 /* ---------- Conexão com o Firebase ---------- */
@@ -102,6 +107,20 @@ function primeiroNome(nome) {
   const f = (w) => w.charAt(0) + w.slice(1).toLowerCase();
   return p.length > 1 ? `${f(p[0])} ${f(p[p.length - 1])}` : f(p[0] || "");
 }
+/** "há 5 min", "ontem", "12/03" */
+function quandoRelativo(ms) {
+  if (!ms) return "";
+  const min = Math.round((Date.now() - ms) / 60000);
+  if (min < 1) return "agora";
+  if (min < 60) return `há ${min} min`;
+  const horas = Math.round(min / 60);
+  if (horas < 24) return `há ${horas} h`;
+  const dias = Math.round(horas / 24);
+  if (dias === 1) return "ontem";
+  if (dias < 7) return `há ${dias} dias`;
+  return new Date(ms).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
+}
+
 const linkDaTroca = (id) => `${location.origin}${location.pathname}#/t/${id}`;
 
 /** Soma dias a uma data no formato "2026-10-01". */
@@ -112,6 +131,20 @@ function somarDias(iso, dias) {
 }
 const inicioDoMes = () => hojeISO().slice(0, 8) + "01";
 const maiusculo = (s) => String(s || "").trim().toUpperCase();
+
+/** Carrega um arquivo .js sob demanda (uma única vez). */
+const scriptsCarregados = {};
+function carregarScript(url) {
+  if (scriptsCarregados[url]) return scriptsCarregados[url];
+  scriptsCarregados[url] = new Promise((ok, falhou) => {
+    const el = document.createElement("script");
+    el.src = url;
+    el.onload = ok;
+    el.onerror = () => falhou(new Error("não foi possível carregar " + url));
+    document.head.append(el);
+  });
+  return scriptsCarregados[url];
+}
 
 function senhaAleatoria() {
   const c = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -133,6 +166,11 @@ function mensagemErro(e) {
     "auth/network-request-failed": "Sem conexão. Verifique a internet e tente de novo.",
     "auth/requires-recent-login": "Por segurança, saia e entre de novo antes de trocar a senha.",
     "auth/operation-not-allowed": "O login por e-mail/senha não está ativado no Firebase.",
+    "functions/permission-denied": "Você só pode redefinir a senha de alguém da sua equipe.",
+    "functions/not-found": "Usuário não encontrado.",
+    "functions/invalid-argument": "Dados inválidos para redefinir a senha.",
+    "functions/unavailable": "A função de redefinir senha não respondeu. Verifique se ela está publicada.",
+    "internal": "A função de redefinir senha não respondeu. Verifique se ela está publicada e se o app está com USAR_REDEFINICAO = true.",
     "auth/unauthorized-domain": "Este endereço não está autorizado no Firebase (Authentication > Configurações > Domínios autorizados).",
     "permission-denied": "Você não tem permissão para essa ação.",
     unavailable: "Sem conexão com o servidor. Tente de novo.",
@@ -225,6 +263,15 @@ const Banco = {
       });
     }
     await b.commit();
+  },
+
+  /** Define uma senha provisória para outra pessoa (roda no servidor, por segurança). */
+  async redefinirSenha(uid, senha) {
+    // a biblioteca de funções do Firebase só é baixada neste momento
+    if (!firebase.app().functions) await carregarScript("https://www.gstatic.com/firebasejs/12.19.0/firebase-functions-compat.js");
+    const fn = firebase.app().functions(REGIAO_FUNCOES).httpsCallable("redefinirSenha");
+    const r = await fn({ uid, senha });
+    return r.data;
   },
 
   async trocarMinhaSenha(uid, senha) {
@@ -455,6 +502,94 @@ const Pdf = {
 
 
 /* =====================================================================
+   4.5 CENTRAL DE NOTIFICAÇÕES
+   As notificações são montadas a partir dos revezamentos que o app já carregou,
+   sem buscar nada a mais no banco. O que já foi lido fica guardado no aparelho.
+   ===================================================================== */
+const Notificacoes = {
+  perfil: null, parar: null, lista: [], avisos: new Set(),
+
+  chaveLidas: (uid) => "notificacoes-lidas:" + uid,
+
+  lidas() {
+    try { return JSON.parse(localStorage.getItem(Notificacoes.chaveLidas(Notificacoes.perfil.uid))) || {}; }
+    catch (e) { return {}; }
+  },
+  salvarLidas(obj) {
+    try { localStorage.setItem(Notificacoes.chaveLidas(Notificacoes.perfil.uid), JSON.stringify(obj)); } catch (e) { /* ignora */ }
+  },
+
+  /** Começa a acompanhar os revezamentos da pessoa (uma vez, logo após o login). */
+  iniciar(perfil) {
+    Notificacoes.encerrar();
+    Notificacoes.perfil = perfil;
+    Notificacoes.parar = Banco.ouvirTrocas(perfil, (trocas) => {
+      Notificacoes.lista = Notificacoes.montar(perfil, trocas);
+      Notificacoes.avisar();
+    }, () => { /* sem notificações se a lista falhar */ });
+  },
+  encerrar() {
+    if (Notificacoes.parar) Notificacoes.parar();
+    Notificacoes.parar = null; Notificacoes.lista = []; Notificacoes.perfil = null;
+  },
+
+  /** Transforma a situação de cada revezamento em um aviso curto. */
+  montar(perfil, trocas) {
+    const avisos = [];
+    const add = (t, texto, acao) => avisos.push({
+      chave: t.id + ":" + t.etapa, id: t.id, texto, acao,
+      detalhe: [primeiroNome(t.solicitante.nome) + (t.parceiro ? " ⇄ " + primeiroNome(t.parceiro.nome) : ""),
+        "folga " + dataBR(t.dataFolgaSolicitante, true) + (t.dataFolgaParceiro ? " e " + dataBR(t.dataFolgaParceiro, true) : "")].join(" · "),
+      ms: t.atualizadoEm && t.atualizadoEm.toMillis ? t.atualizadoEm.toMillis() : 0,
+    });
+    trocas.forEach((t) => {
+      const souSolicitante = t.solicitanteUid === perfil.uid;
+      const souParceiro = t.parceiroUid === perfil.uid;
+      const souGestor = perfil.papel === "gestor" && t.gestores.includes(perfil.uid);
+      const eu = souSolicitante ? t.parceiro : t.solicitante;
+      const outro = eu ? primeiroNome(eu.nome) : "O colega";
+      const dupla = primeiroNome(t.solicitante.nome) + (t.parceiro ? " e " + primeiroNome(t.parceiro.nome) : "");
+      if (souSolicitante || souParceiro) {
+        if (t.etapa === "aguardando_gestor" && souSolicitante) add(t, `${outro} aceitou o revezamento. Agora é com o gestor.`, "Ver pedido");
+        if (t.etapa === "aprovada") add(t, "Seu revezamento foi aprovado.", "Ver pedido");
+        if (t.etapa === "recusada") add(t, "Seu revezamento foi recusado pelo gestor.", "Ver motivo");
+        if (t.etapa === "concluida") add(t, "Revezamento concluído. O documento já foi gerado.", "Ver pedido");
+        if (t.etapa === "cancelada" && souParceiro) add(t, `${outro} cancelou o revezamento.`, "Ver pedido");
+      }
+      if (souGestor && t.etapa === "aguardando_gestor" && !(t.aprovacoes || {})[perfil.uid]) {
+        add(t, `${dupla} combinaram um revezamento e aguardam a sua aprovação.`, "Aprovar");
+      }
+      if ((souGestor || perfil.papel === "admin") && t.etapa === "aprovada") {
+        add(t, `${dupla}: revezamento aprovado, falta gerar o PDF e concluir.`, "Concluir");
+      }
+    });
+    return avisos.sort((a, b) => b.ms - a.ms).slice(0, 50);
+  },
+
+  naoLidas() {
+    const lidas = Notificacoes.lidas();
+    return Notificacoes.lista.filter((n) => !lidas[n.chave]);
+  },
+  marcarTodasLidas() {
+    const lidas = Notificacoes.lidas();
+    Notificacoes.lista.forEach((n) => { lidas[n.chave] = 1; });
+    // guarda só o que ainda está na lista, para o registro não crescer sem parar
+    const atuais = {};
+    Notificacoes.lista.forEach((n) => { if (lidas[n.chave]) atuais[n.chave] = 1; });
+    Notificacoes.salvarLidas(atuais);
+    Notificacoes.avisar();
+  },
+
+  aoMudar(fn) { Notificacoes.avisos.add(fn); fn(); },
+  avisar() {
+    Notificacoes.avisos.forEach((fn) => {
+      if (fn.elemento && !document.contains(fn.elemento)) return Notificacoes.avisos.delete(fn);
+      fn();
+    });
+  },
+};
+
+/* =====================================================================
    5. INTERFACE — peças reutilizáveis
    h("div", { class: "x", onClick: fn }, "texto", outroElemento) cria um elemento.
    ===================================================================== */
@@ -531,6 +666,7 @@ function tela({ titulo, sub, voltar, menu = [], abas = true, acao, direita, perf
     voltar && h("button", { class: "voltar", onClick: voltar, "aria-label": "Voltar" }, "←"),
     h("div", { class: "titulos" }, h("h1", {}, titulo), sub && h("small", {}, sub)),
     h("div", { class: "topo-direita" }, direita,
+      perfil && sino(),
       acao && h("button", { class: "btn primario so-desktop", onClick: acao.onClick }, acao.rotulo),
       perfil && !voltar && h("button", { class: "sair-celular", onClick: sair }, "Sair")));
 
@@ -542,6 +678,22 @@ function tela({ titulo, sub, voltar, menu = [], abas = true, acao, direita, perf
     acao && h("button", { class: "btn primario flutuante", onClick: acao.onClick }, acao.rotulo)));
   window.scrollTo(0, 0);
   return main;
+}
+
+/** Sino com a quantidade de avisos não lidos. */
+function sino() {
+  const conta = h("span", { class: "badge", hidden: true });
+  const b = h("button", { class: "sino", "aria-label": "Notificações", onClick: () => ir("/notificacoes") },
+    h("span", { class: "sino-icone", "aria-hidden": "true" }, "🔔"), conta);
+  const atualizar = () => {
+    const n = Notificacoes.naoLidas().length;
+    conta.textContent = n > 9 ? "9+" : String(n);
+    conta.hidden = n === 0;
+    b.classList.toggle("tem-aviso", n > 0);
+  };
+  atualizar.elemento = b;
+  Notificacoes.aoMudar(atualizar);
+  return b;
 }
 
 let timerToast;
@@ -739,6 +891,9 @@ function filtrarTrocas(lista, f) {
   });
 }
 
+/** Há busca ou filtro em uso? */
+function temFiltro(f) { return Boolean(f.busca.trim()) || filtrosAtivos(f) > 0; }
+
 /** Quantos filtros estão ativos (fora a busca, que já aparece escrita no campo). */
 function filtrosAtivos(f) {
   return (f.situacoes.length ? 1 : 0) + (f.periodo !== "todos" ? 1 : 0) + (f.equipe ? 1 : 0) + (f.gestor ? 1 : 0);
@@ -825,7 +980,32 @@ function listaComMais(lista, f, aoMudar, montar) {
   ];
 }
 
-/* ---------- 6.3 Colaborador ---------- */
+/* ---------- 6.3 Central de notificações ---------- */
+function telaNotificacoes(perfil) {
+  const main = tela({ titulo: "Notificações", sub: "Avisos dos seus revezamentos", voltar: () => ir("/"), perfil, menu: menuDe(perfil, "/"), abas: false });
+  const area = h("div", { class: "pilha" });
+  mais(main, area);
+
+  const desenhar = () => {
+    const lidas = Notificacoes.lidas();
+    const lista = Notificacoes.lista;
+    if (!lista.length) {
+      return por(area, h("div", { class: "cartao vazio" }, h("b", {}, "Nenhuma notificação"),
+        "Os avisos sobre os seus revezamentos aparecem aqui."));
+    }
+    por(area, h("div", { class: "pilha avisos" }, lista.map((n) => h("a", {
+      class: "item aviso-item" + (lidas[n.chave] ? "" : " nao-lida"), href: "#/t/" + n.id,
+    }, h("div", { class: "aviso-txt" }, h("p", {}, n.texto),
+        h("span", { class: "sub" }, n.detalhe), h("span", { class: "sub" }, quandoRelativo(n.ms))),
+      h("span", { class: "aviso-acao" }, n.acao)))));
+  };
+  desenhar.elemento = area;
+  Notificacoes.aoMudar(desenhar);
+  // abrir a central marca tudo como lido
+  setTimeout(() => Notificacoes.marcarTodasLidas(), 1200);
+}
+
+/* ---------- 6.4 Colaborador ---------- */
 let filtroMeus = filtroVazio();
 
 function telaInicioColaborador(perfil) {
@@ -855,23 +1035,28 @@ function telaInicioColaborador(perfil) {
         "Toque em ", h("strong", {}, "Novo revezamento"), ", escolha o dia da sua folga e envie o link para o colega que vai trabalhar no seu lugar."));
     }
     por(area,
-      ativas.length > 0 && [h("div", { class: "secao" }, "Em andamento"), h("div", { class: "grade" }, ativas.map(item))],
-      anteriores.length > 0 && [h("div", { class: "secao" }, "Anteriores"), historico(anteriores)]);
+      h("div", { class: "secao" }, "Em andamento"),
+      ativas.length ? h("div", { class: "grade" }, ativas.map(item))
+        : h("div", { class: "cartao vazio" }, h("b", {}, "Nenhum revezamento em andamento"), "Seus pedidos anteriores aparecem na busca abaixo."),
+      anteriores.length > 0 && busca(anteriores));
   }, () => por(area, aviso("erro", "Não foi possível carregar seus revezamentos."))));
 
-  /** Histórico do colaborador: mostra poucos de cada vez e, se houver muitos, ganha busca. */
-  function historico(lista) {
+  /** Revezamentos anteriores: a lista só aparece quando há busca ou filtro. */
+  function busca(lista) {
     const f = filtroMeus;
     const caixa = h("div", { class: "pilha" });
     const atualizar = () => {
+      if (!temFiltro(f)) {
+        return por(caixa, h("p", { class: "sub contagem" },
+          `Você tem ${lista.length} ${lista.length === 1 ? "revezamento anterior" : "revezamentos anteriores"}. Busque ou use os filtros para vê-los.`));
+      }
       const r = filtrarTrocas(lista, f);
       por(caixa, r.length ? listaComMais(r, f, atualizar, (v) => h("div", { class: "grade" }, v.map(item)))
         : h("p", { class: "sub contagem" }, "Nenhum resultado com esses filtros."));
     };
     atualizar();
-    return lista.length > 5
-      ? h("div", { class: "pilha" }, painelFiltros(f, { equipes: [], gestores: [] }, atualizar), caixa)
-      : caixa;
+    return h("div", { class: "pilha" }, h("div", { class: "secao" }, "Anteriores"),
+      painelFiltros(f, { equipes: [], gestores: [] }, atualizar), caixa);
   }
 }
 
@@ -904,7 +1089,7 @@ function telaNovaTroca(perfil) {
   });
 }
 
-/* ---------- 6.4 Detalhe do revezamento (convite, aprovação, PDF) ---------- */
+/* ---------- 6.5 Detalhe do revezamento (convite, aprovação, PDF) ---------- */
 function telaTroca(perfil, id) {
   const base = { perfil, menu: menuDe(perfil, "/t/"), abas: false, voltar: () => ir("/") };
   let main = tela({ ...base, titulo: "Revezamento" });
@@ -1097,9 +1282,10 @@ function telaTroca(perfil, id) {
   }
 }
 
-/* ---------- 6.5 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
+/* ---------- 6.6 Gestor e RH: pendentes, todas as trocas, equipe ---------- */
 // Guardado fora da função para o gestor não perder os filtros ao abrir uma troca e voltar.
 let filtroTrocas = filtroVazio();
+let filtroPendentes = filtroVazio();
 
 function telaInicioGestor(perfil, rota) {
   const ehAdmin = perfil.papel === "admin";
@@ -1128,11 +1314,7 @@ function telaInicioGestor(perfil, rota) {
   function preencher() {
     if (aba === "equipe") return por(main, equipe());
     if (estado.trocas === null) return por(main, carregando());
-    if (aba === "pendentes") {
-      const lista = pendentesDe(estado.trocas);
-      return por(main, lista.length ? grade(lista)
-        : h("div", { class: "cartao vazio" }, h("b", {}, "Nada pendente"), "Quando houver um revezamento para aprovar ou concluir, ele aparece aqui."));
-    }
+    if (aba === "pendentes") return por(main, pendentes());
     por(main, todas());
   }
 
@@ -1155,6 +1337,33 @@ function telaInicioGestor(perfil, rota) {
       equipes: [...equipes].sort((a, b) => a.localeCompare(b, "pt-BR", { numeric: true })).map((e) => ({ id: e, rotulo: "Equipe " + e })),
       gestores: ehAdmin ? [...gestores].sort((a, b) => a[1].localeCompare(b[1], "pt-BR")).map(([id, rotulo]) => ({ id, rotulo })) : [],
     };
+  }
+
+  /** Primeira tela: só o que precisa de ação. Os demais aparecem quando se busca ou filtra. */
+  function pendentes() {
+    const lista = pendentesDe(estado.trocas);
+    const f = filtroPendentes;
+    const caixa = h("div", { class: "pilha" });
+    const outros = estado.trocas.filter((t) => !lista.includes(t));
+    const atualizar = () => {
+      if (!temFiltro(f)) {
+        return por(caixa, h("p", { class: "sub contagem" },
+          outros.length ? `Há ${outros.length} ${outros.length === 1 ? "outro revezamento" : "outros revezamentos"}. Busque ou use os filtros para vê-los.`
+            : "Nenhum outro revezamento registrado."));
+      }
+      const r = filtrarTrocas(outros, f);
+      por(caixa, r.length ? listaComMais(r, f, atualizar, grade)
+        : h("p", { class: "sub contagem" }, "Nenhum resultado com esses filtros."));
+    };
+    atualizar();
+    return [
+      h("div", { class: "secao" }, lista.length ? `Para resolver (${lista.length})` : "Para resolver"),
+      lista.length ? grade(lista)
+        : h("div", { class: "cartao vazio" }, h("b", {}, "Nada pendente"), "Quando houver um revezamento para aprovar ou concluir, ele aparece aqui."),
+      outros.length > 0 && h("div", { class: "secao" }, "Buscar nos demais"),
+      outros.length > 0 && painelFiltros(f, opcoesDasTrocas(), atualizar),
+      caixa,
+    ];
   }
 
   function todas() {
@@ -1235,7 +1444,7 @@ function telaInicioGestor(perfil, rota) {
   }
 }
 
-/* ---------- 6.6 Cadastro e edição de usuários ---------- */
+/* ---------- 6.7 Cadastro e edição de usuários ---------- */
 function telaUsuario(perfil, uidAlvo) {
   const ehAdmin = perfil.papel === "admin";
   const novo = uidAlvo === "novo";
@@ -1312,7 +1521,8 @@ function telaUsuario(perfil, uidAlvo) {
           novo && campo("Senha provisória", senha, { inteiro: true, ajuda: "A pessoa troca no primeiro acesso." }),
           !novo && h("label", { class: "campo inteiro check" }, ativo, "Acesso ativo"))),
       erro, podeEditar && botao);
-    mais(main, !podeEditar && aviso("atencao", "Você só pode alterar colaboradores da sua equipe."), h("div", { class: "form-largo" }, form));
+    mais(main, !podeEditar && aviso("atencao", "Você só pode alterar colaboradores da sua equipe."),
+      h("div", { class: "form-largo pilha" }, form, !novo && podeEditar && cartaoSenha(usuario)));
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -1349,13 +1559,40 @@ function telaUsuario(perfil, uidAlvo) {
     nome.focus();
   }
 
+  /** Redefinir a senha de quem esqueceu: gera uma senha provisória nova. */
+  function cartaoSenha(usuario) {
+    if (!USAR_REDEFINICAO) {
+      return h("div", { class: "cartao pilha", style: { gap: "8px" } }, h("h2", {}, "Senha"),
+        h("p", { class: "sub" }, "A redefinição de senha ainda não está ativada neste app. Enquanto isso, só a própria pessoa pode trocar a senha dela. Veja como ativar no arquivo LEIA-ME."));
+    }
+    const nova = h("input", { value: "", autocomplete: "off", placeholder: "Senha provisória" });
+    const erro = caixaErro();
+    const gerar = h("button", { type: "button", class: "btn" }, "Gerar");
+    const botao = h("button", { type: "button", class: "btn primario" }, "Redefinir senha");
+    gerar.addEventListener("click", () => { nova.value = senhaAleatoria(); });
+    botao.addEventListener("click", async () => {
+      if (nova.value.length < 6) return erro.mostrar("A senha precisa ter pelo menos 6 caracteres.");
+      erro.mostrar(""); botao.disabled = true; botao.textContent = "Redefinindo…";
+      try {
+        await Banco.redefinirSenha(usuario.uid, nova.value);
+        credenciais(usuario.nome, usuario.matricula, nova.value, true);
+      } catch (err) {
+        erro.mostrar(mensagemErro(err)); botao.disabled = false; botao.textContent = "Redefinir senha";
+      }
+    });
+    return h("div", { class: "cartao pilha", style: { gap: "12px" } }, h("h2", {}, "Senha"),
+      h("p", { class: "sub" }, "Para quem esqueceu a senha: gere uma senha provisória e passe para a pessoa. No próximo acesso ela cria a própria senha."),
+      campo("Nova senha provisória", nova), erro,
+      h("div", { class: "acoes" }, gerar, botao));
+  }
+
   /** Depois de cadastrar: mostra os dados de acesso para enviar à pessoa. */
-  function credenciais(nome, matricula, senha) {
-    const msg = `Seu acesso ao app de troca de escala:\n${location.origin}${location.pathname}\nMatrícula: ${matricula}\nSenha provisória: ${senha}\nNo primeiro acesso você vai criar a sua própria senha.`;
-    main = tela({ ...base, titulo: "Cadastro feito", sub: nome });
+  function credenciais(nome, matricula, senha, redefinida) {
+    const msg = `Seu acesso ao app de troca de escala:\n${location.origin}${location.pathname}\nMatrícula: ${matricula}\nSenha provisória: ${senha}\nAo entrar, você vai criar a sua própria senha.`;
+    main = tela({ ...base, titulo: redefinida ? "Senha redefinida" : "Cadastro feito", sub: nome });
     mais(main, h("div", { class: "cartao pilha form-largo", style: { gap: "12px" } },
       h("h2", {}, primeiroNome(nome)),
-      h("p", { class: "sub" }, "Passe estes dados para a pessoa. No primeiro acesso ela cria a própria senha."),
+      h("p", { class: "sub" }, "Passe estes dados para a pessoa. Ao entrar, ela cria a própria senha."),
       h("dl", { class: "linha-dados" }, h("dt", {}, "Matrícula"), h("dd", {}, matricula), h("dt", {}, "Senha provisória"), h("dd", { class: "mono" }, senha)),
       h("a", { class: "btn ok bloco", href: "https://wa.me/?text=" + encodeURIComponent(msg), target: "_blank", rel: "noreferrer" }, "Enviar pelo WhatsApp"),
       h("button", { class: "btn bloco", onClick: () => navigator.clipboard.writeText(msg).then(() => toast("Copiado."), () => toast("Não foi possível copiar.")) }, "Copiar dados"),
@@ -1414,6 +1651,7 @@ function desenhar() {
   if (!p.ativo) return mostrarBloqueio("Seu acesso está desativado. Procure o RH ou o seu gestor.");
   if (p.trocarSenha) return telaTrocarSenha(p);
 
+  if (rota === "/notificacoes") return telaNotificacoes(p);
   const troca = rota.match(/^\/t\/([\w-]+)/);
   if (troca) return telaTroca(p, troca[1]);
   if (p.papel === "colaborador") return rota === "/nova" ? telaNovaTroca(p) : telaInicioColaborador(p);
@@ -1428,6 +1666,7 @@ if (pronto) {
     estado.perfil = undefined;
     estado.erroPerfil = false;
     if (pararPerfil) { pararPerfil(); pararPerfil = null; }
+    Notificacoes.encerrar();
     if (u) {
       let anterior = null;
       pararPerfil = Banco.ouvirPerfil(u.uid, (perfil) => {
@@ -1436,6 +1675,7 @@ if (pronto) {
         if (chave === anterior) return;
         anterior = chave;
         estado.perfil = perfil;
+        if (perfil && perfil.ativo && !perfil.trocarSenha) Notificacoes.iniciar(perfil);
         desenhar();
       }, () => { estado.erroPerfil = true; desenhar(); });
     }
