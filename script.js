@@ -30,6 +30,17 @@ const DOMINIO_LOGIN = "colaboradores.troca-escala.app";
 
 const EMPRESAS = ["BIANCOGRES", "LM COMÉRCIO"];
 
+// Aviso por e-mail quando os dois colaboradores confirmam o revezamento.
+// O envio é feito pelo EmailJS (emailjs.com). Veja o passo a passo em LEIA-ME-EMAIL.md.
+const USAR_EMAIL = false;              // troque para true depois de configurar o EmailJS
+const EMAILJS = {
+  servico: "",                          // Service ID   (ex.: service_ab12cd3)
+  modelo: "",                           // Template ID  (ex.: template_xy45z6)
+  chavePublica: "",                     // Public Key   (ex.: aB1cD2eF3gH4iJ5kL)
+  destino: "",                          // para quem vai o aviso (ex.: fulano@gmail.com)
+};
+const EMAILJS_CDN = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js";
+
 // Redefinição de senha pelo gestor/RH. Precisa da função "redefinirSenha" publicada
 // (pasta funcao-redefinir-senha). Deixe false enquanto ela não estiver no ar.
 const USAR_REDEFINICAO = false;
@@ -208,6 +219,32 @@ function mensagemErro(e) {
    Coleções: usuarios/{uid}, trocas/{id}, config/setup.
    Quem pode ler e gravar cada coisa é definido no firestore.rules.
    ===================================================================== */
+/** Campos enviados ao modelo do EmailJS. Os nomes aparecem no modelo como {{campo}}. */
+function dadosDoEmail(t) {
+  const s = t.solicitante, p = t.parceiro;
+  const pessoa = (x) => `${x.nome} (mat. ${x.matricula}${x.equipe ? ", equipe " + x.equipe : ""})`;
+  return {
+    to_email: EMAILJS.destino,
+    assunto: `Revezamento de escala: ${primeiroNome(s.nome)} e ${primeiroNome(p.nome)}`,
+
+    colaborador_1: s.nome, matricula_1: s.matricula, equipe_1: s.equipe || "—",
+    gestor_1: s.gestorNome || "—", folga_1: dataBR(t.dataFolgaSolicitante),
+    dia_semana_1: diaSemana(t.dataFolgaSolicitante), cobre_1: p.nome,
+
+    colaborador_2: p.nome, matricula_2: p.matricula, equipe_2: p.equipe || "—",
+    gestor_2: p.gestorNome || "—", folga_2: dataBR(t.dataFolgaParceiro),
+    dia_semana_2: diaSemana(t.dataFolgaParceiro), cobre_2: s.nome,
+
+    observacao: t.observacao || "—",
+    link: linkDaTroca(t.id),
+    // texto corrido, caso você prefira um modelo de uma linha só
+    resumo: [
+      `${pessoa(s)} folga em ${dataBR(t.dataFolgaSolicitante)} e ${p.nome} trabalha no lugar.`,
+      `${pessoa(p)} folga em ${dataBR(t.dataFolgaParceiro)} e ${s.nome} trabalha no lugar.`,
+    ].join(" "),
+  };
+}
+
 const Banco = {
   async sistemaConfigurado() {
     const s = await db.collection("config").doc("setup").get();
@@ -298,6 +335,22 @@ const Banco = {
     return r.data;
   },
 
+  /**
+   * Avisa por e-mail que os dois colaboradores confirmaram o revezamento.
+   * Nunca interrompe o fluxo: se o envio falhar, a troca continua valendo.
+   */
+  async avisarPorEmail(troca) {
+    if (!USAR_EMAIL) return;
+    const faltando = Object.entries(EMAILJS).filter(([, v]) => !v).map(([k]) => k);
+    if (faltando.length) return console.warn("EmailJS sem configuração:", faltando.join(", "));
+    try {
+      await carregarScript(EMAILJS_CDN);
+      await window.emailjs.send(EMAILJS.servico, EMAILJS.modelo, dadosDoEmail(troca), { publicKey: EMAILJS.chavePublica });
+    } catch (e) {
+      console.warn("Aviso por e-mail não enviado:", (e && e.text) || e);
+    }
+  },
+
   async trocarMinhaSenha(uid, senha) {
     await auth.currentUser.updatePassword(senha);
     await db.collection("usuarios").doc(uid).update({ trocarSenha: false });
@@ -363,15 +416,18 @@ const Banco = {
 
   async aceitarTroca(troca, perfil, { dataFolga, entrada, saida }) {
     const g0 = troca.gestores[0];
+    const parceiro = Banco.retrato(perfil, entrada, saida);
     await db.collection("trocas").doc(troca.id).update({
       etapa: "aguardando_gestor",
       parceiroUid: perfil.uid,
-      parceiro: Banco.retrato(perfil, entrada, saida),
+      parceiro,
       dataFolgaParceiro: dataFolga,
       participantes: [troca.solicitanteUid, perfil.uid],
       gestores: perfil.gestorUid === g0 ? [g0] : [g0, perfil.gestorUid],
       atualizadoEm: agora(),
     });
+    // os dois confirmaram: avisa por e-mail com a troca já completa
+    Banco.avisarPorEmail({ ...troca, parceiro, dataFolgaParceiro: dataFolga });
   },
 
   async cancelarTroca(troca) {
