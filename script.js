@@ -32,12 +32,12 @@ const EMPRESAS = ["BIANCOGRES", "LM COMÉRCIO"];
 
 // Aviso por e-mail quando os dois colaboradores confirmam o revezamento.
 // O envio é feito pelo EmailJS (emailjs.com). Veja o passo a passo em LEIA-ME-EMAIL.md.
-const USAR_EMAIL = false;              // troque para true depois de configurar o EmailJS
+const USAR_EMAIL = true;               // false desliga o aviso por e-mail
 const EMAILJS = {
-  servico: "",                          // Service ID   (ex.: service_ab12cd3)
-  modelo: "",                           // Template ID  (ex.: template_xy45z6)
-  chavePublica: "",                     // Public Key   (ex.: aB1cD2eF3gH4iJ5kL)
-  destino: "",                          // para quem vai o aviso (ex.: fulano@gmail.com)
+  servico: "service_vl3rcop",           // Service ID
+  modelo: "template_i3smkw1",           // Template ID
+  chavePublica: "YUkpAHaDZ8R5SJveC",    // Public Key
+  destino: "jeanthielis@gmail.com",     // para quem vai o aviso
 };
 const EMAILJS_CDN = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js";
 
@@ -219,6 +219,22 @@ function mensagemErro(e) {
    Coleções: usuarios/{uid}, trocas/{id}, config/setup.
    Quem pode ler e gravar cada coisa é definido no firestore.rules.
    ===================================================================== */
+/** Revezamento fictício, usado só pelo botão de teste do RH. */
+function trocaDeTeste(perfil) {
+  const pessoa = (nome, matricula, equipe, gestor) => ({
+    nome, matricula, equipe, gestorNome: gestor, empresa: "BIANCOGRES",
+    entrada: "6h", saida: "18h", horario: "06H AS 18H",
+  });
+  return {
+    id: "teste",
+    solicitante: pessoa("EXEMPLO DE COLABORADOR (TESTE)", "0001", "1", perfil.nome),
+    parceiro: pessoa("EXEMPLO DE COLEGA (TESTE)", "0002", "2", perfil.nome),
+    dataFolgaSolicitante: somarDias(hojeISO(), 7),
+    dataFolgaParceiro: somarDias(hojeISO(), 10),
+    observacao: "Este é um e-mail de teste enviado pela tela de usuários. Nenhum revezamento foi criado.",
+  };
+}
+
 /** Campos enviados ao modelo do EmailJS. Os nomes aparecem no modelo como {{campo}}. */
 function dadosDoEmail(t) {
   const s = t.solicitante, p = t.parceiro;
@@ -339,15 +355,21 @@ const Banco = {
    * Avisa por e-mail que os dois colaboradores confirmaram o revezamento.
    * Nunca interrompe o fluxo: se o envio falhar, a troca continua valendo.
    */
-  async avisarPorEmail(troca) {
-    if (!USAR_EMAIL) return;
+  async avisarPorEmail(troca, propagarErro) {
+    if (!USAR_EMAIL && !propagarErro) return;
     const faltando = Object.entries(EMAILJS).filter(([, v]) => !v).map(([k]) => k);
-    if (faltando.length) return console.warn("EmailJS sem configuração:", faltando.join(", "));
+    if (faltando.length) {
+      const msg = "Falta preencher no script.js: " + faltando.join(", ");
+      if (propagarErro) throw new Error(msg);
+      return console.warn("EmailJS sem configuração. " + msg);
+    }
     try {
       await carregarScript(EMAILJS_CDN);
       await window.emailjs.send(EMAILJS.servico, EMAILJS.modelo, dadosDoEmail(troca), { publicKey: EMAILJS.chavePublica });
     } catch (e) {
-      console.warn("Aviso por e-mail não enviado:", (e && e.text) || e);
+      const msg = (e && (e.text || e.message)) || String(e);
+      if (propagarErro) throw new Error(msg);
+      console.warn("Aviso por e-mail não enviado:", msg);
     }
   },
 
@@ -1686,7 +1708,7 @@ function telaInicioGestor(perfil, rota) {
   }
 
   function preencher() {
-    if (aba === "equipe") return por(main, equipe());
+    if (aba === "equipe") return por(main, equipe(), testeDeEmail());
     if (estado.trocas === null) return por(main, carregando());
     if (aba === "calendario") return por(main, calendario(estado.trocas, (id) => ir("/t/" + id)));
     if (aba === "pendentes") return por(main, pendentes());
@@ -1794,6 +1816,35 @@ function telaInicioGestor(perfil, rota) {
     };
     atualizar();
     return [painelFiltros(f, opcoesDasTrocas(), atualizar), resultado];
+  }
+
+  /** Cartão do RH para conferir se o aviso por e-mail está funcionando. */
+  function testeDeEmail() {
+    if (!ehAdmin) return null;
+    const resultado = h("div", {});
+    const botao = h("button", { class: "btn primario", type: "button" }, "Enviar e-mail de teste");
+    const estado = USAR_EMAIL
+      ? h("p", { class: "sub" }, "Ligado. O aviso é enviado para ", h("b", {}, EMAILJS.destino || "(destino não preenchido)"),
+          " quando os dois colaboradores confirmam o revezamento.")
+      : h("p", { class: "sub" }, "Desligado no momento. Para ligar, troque ", h("b", {}, "USAR_EMAIL"), " para ",
+          h("b", {}, "true"), " no início do script.js. O teste abaixo funciona mesmo desligado.");
+
+    botao.addEventListener("click", async () => {
+      botao.disabled = true; botao.textContent = "Enviando…";
+      por(resultado);
+      try {
+        await Banco.avisarPorEmail(trocaDeTeste(perfil), true);
+        por(resultado, aviso("ok", `E-mail de teste enviado para ${EMAILJS.destino}. Confira a caixa de entrada e o spam.`));
+      } catch (e) {
+        por(resultado, aviso("erro", "Não foi possível enviar: " + e.message),
+          h("p", { class: "sub" }, "Confira no EmailJS o Service ID, o Template ID, a Public Key e se o endereço do site está na Allow List (Account → Security)."));
+      } finally {
+        botao.disabled = false; botao.textContent = "Enviar e-mail de teste";
+      }
+    });
+
+    return h("div", { class: "cartao pilha", style: { gap: "10px" } },
+      h("h2", {}, "Aviso por e-mail"), estado, resultado, h("div", { class: "acoes" }, botao));
   }
 
   function equipe() {
