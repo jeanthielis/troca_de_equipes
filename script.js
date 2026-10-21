@@ -1818,9 +1818,8 @@ function telaInicioGestor(perfil, rota) {
     return [painelFiltros(f, opcoesDasTrocas(), atualizar), resultado];
   }
 
-  /** Cartão do RH para conferir se o aviso por e-mail está funcionando. */
+  /** Cartão do RH e do gestor para conferir se o aviso por e-mail está funcionando. */
   function testeDeEmail() {
-    if (!ehAdmin) return null;
     const resultado = h("div", {});
     const botao = h("button", { class: "btn primario", type: "button" }, "Enviar e-mail de teste");
     const estado = USAR_EMAIL
